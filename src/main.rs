@@ -20,7 +20,7 @@ use eframe::egui::{self, Color32, CornerRadius, RichText};
 use lang::Language;
 use model_mgr::{ImportJob, ModelFile, ModelKind, ModelManager, format_file_size};
 use monitor::Monitor;
-use service::{LogLevel, ServiceManager, ServiceStatus, ServiceType, find_llama_exe};
+use service::{LogLevel, ServiceManager, ServiceStatus, ServiceType, find_llama_exe, model_alias};
 use theme::{CONTROL_HEIGHT, apply_theme, card_frame, palette};
 use tray::{SystemTray, TrayAction, check_tray_events};
 
@@ -1712,7 +1712,7 @@ impl RagGuiApp {
                     let model_name = if model_file.trim().is_empty() {
                         lang.t("未选择", "Not selected").to_string()
                     } else {
-                        ServiceType::api_model_name(&model_file)
+                        model_alias(&model_file)
                     };
                     if api_row(
                         ui,
@@ -2302,7 +2302,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([780.0, 330.0])
-            .with_min_inner_size([720.0, 330.0])
+            .with_min_inner_size([760.0, 300.0])
             .with_icon(Arc::new(window_icon))
             .with_title("向量/重排模型管理器"),
         ..Default::default()

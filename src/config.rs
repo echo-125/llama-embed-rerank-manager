@@ -126,6 +126,7 @@ mod tests {
         let config = AppConfig {
             embedding_port: 10032,
             rerank_port: 10033,
+            ignored_models: vec!["removed.gguf".to_string()],
             llama_exe_path: Some(r"C:\tools\llama.exe".to_string()),
             dark_mode: true,
             language: Language::En,
@@ -136,6 +137,7 @@ mod tests {
         let loaded = AppConfig::load(&dir);
         assert_eq!(loaded.embedding_port, 10032);
         assert_eq!(loaded.rerank_port, 10033);
+        assert_eq!(loaded.ignored_models, vec!["removed.gguf".to_string()]);
         assert_eq!(
             loaded.llama_exe_path.as_deref(),
             Some(r"C:\tools\llama.exe")

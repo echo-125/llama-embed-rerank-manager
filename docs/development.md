@@ -7,7 +7,7 @@
 | `src/main.rs` | GUI 主体：模型运行 / 模型文件 / 运行日志 / 设置，主题 / 语言、弹窗、托盘事件 |
 | `src/service.rs` | 向量 / 重排模型的进程、健康检查、PID、端口、`--alias` |
 | `src/monitor.rs` | 内存 / 显存 / GPU 采样 |
-| `src/model_mgr.rs` | GGUF 扫描、导入、类型判断、维度读取、移除导入 |
+| `src/model_mgr.rs` | GGUF 扫描、导入、类型判断与维度读取 |
 | `src/config.rs` | `config.json` 读写 |
 | `src/lang.rs` | 中英文文案 |
 | `src/theme.rs` | 明暗主题与调色板 |
@@ -35,7 +35,7 @@ copy target\release\llama-rag-gui.exe .
 ## 修改时的同步点
 
 - 默认端口、模型名与 llama-server 参数：`src/service.rs` 与本地 `start-rag-servers.ps1`
-- 接入模型名：`ServiceType::api_model_name`、`start_service` 的 `--alias`、启动脚本
+- 接入模型名：`model_alias`、`start_service` 的 `--alias`、启动脚本
 - 模型类型判断：`ModelKind::classify` 与模型下拉过滤
 - 新增配置字段：`AppConfig`、README/docs、`config.json` 示例
 

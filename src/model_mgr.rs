@@ -181,7 +181,7 @@ impl ModelManager {
             }
         }
 
-        // Sort descending by size or name
+        // 按文件名排序，保证界面顺序稳定。
         list.sort_by(|a, b| a.file_name.cmp(&b.file_name));
         list
     }

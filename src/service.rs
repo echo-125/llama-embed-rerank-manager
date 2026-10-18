@@ -50,14 +50,6 @@ impl ServiceType {
         }
     }
 
-    /// 客户端接入时使用的模型名：所选模型文件名去掉 `.gguf`。
-    pub fn api_model_name(model_file: &str) -> String {
-        Path::new(model_file)
-            .file_stem()
-            .map(|stem| stem.to_string_lossy().to_string())
-            .unwrap_or_else(|| model_file.to_string())
-    }
-
     /// llama-server 的推理参数。
     ///
     /// 必须与 `start-rag-servers.ps1` 中 `$services` 的 `Args` 保持一致：
@@ -93,6 +85,14 @@ impl ServiceType {
             ],
         }
     }
+}
+
+/// 客户端接入时使用的模型名：所选模型文件名去掉 `.gguf`。
+pub fn model_alias(model_file: &str) -> String {
+    Path::new(model_file)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_else(|| model_file.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -403,7 +403,7 @@ impl ServiceManager {
             .arg(port.to_string())
             .arg("--no-ui")
             .arg("--alias")
-            .arg(ServiceType::api_model_name(&model_file));
+            .arg(model_alias(&model_file));
 
         for arg in svc_type.extra_args() {
             cmd.arg(arg);
@@ -413,13 +413,18 @@ impl ServiceManager {
         cmd.stderr(Stdio::piped());
         cmd.creation_flags(CREATE_NO_WINDOW);
 
-        let mut child = cmd.spawn().map_err(|e| {
-            if self.lang.is_zh() {
-                format!("启动进程失败: {e}")
-            } else {
-                format!("Failed to start process: {e}")
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                let err = if self.lang.is_zh() {
+                    format!("启动进程失败: {e}")
+                } else {
+                    format!("Failed to start process: {e}")
+                };
+                self.services[idx].status = ServiceStatus::Failed(err.clone());
+                return Err(err);
             }
-        })?;
+        };
         let pid = child.id();
 
         let pid_file = service_pid_file(&self.base_dir, svc_type);
@@ -677,4 +682,18 @@ pub fn find_llama_exe() -> Option<PathBuf> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::model_alias;
+
+    #[test]
+    fn model_alias_strips_gguf_extension() {
+        assert_eq!(
+            model_alias("Qwen3-Embedding-4B-Q6_K.gguf"),
+            "Qwen3-Embedding-4B-Q6_K"
+        );
+        assert_eq!(model_alias("no-extension"), "no-extension");
+    }
 }

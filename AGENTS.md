@@ -49,7 +49,7 @@ llama.cpp（`llama-server`）的两个检索服务 —— 文本向量化（默�
 - `assets/` — 图标源文件与构建资源：`llama-logo.svg`、`llama.ico`、`logo_32.rgba`、`logo_128.rgba`、`screenshot.png`
 - `build.rs` — 嵌入 Windows exe 图标
 - `start-gui.cmd` — 双击启动 GUI
-- `start-rag-servers.ps1` / `.cmd` — 本地无 GUI 启停脚本（已忽略，不随仓库发布）；读取 `config.json` 的端口与 llama 路径
+- `start-rag-servers.ps1` / `.cmd` — 本地无 GUI 启停脚本（已忽略，不随仓库发布）；读取 `config.json` 的端口、模型与 llama 路径
 - `gguf-info.ps1` — 本地 GGUF 信息工具（已忽略，不随仓库发布）
 - `logs/` — 本地运行日志（已忽略，不随仓库发布）
 - `.ref-m3u8/` — 外部 UI 参考代码，不参与构建，不要提交
@@ -69,7 +69,7 @@ llama.cpp（`llama-server`）的两个检索服务 —— 文本向量化（默�
 - **移除导入不是删除**：模型文件页的「移除」只把文件名写入 `ignored_models` 并从列表隐藏，磁盘文件保留；
   若该模型被停止中的服务选中会同时清空选择。页面提供「恢复已移除」入口。
 - **接入模型名**：启动时传 `--alias`，值为所选模型文件名去掉 `.gguf`；API 弹窗展示同一名称。改规则要同步
-  `ServiceType::api_model_name`、`start_service` 的参数和 `start-rag-servers.ps1`。
+  `model_alias`、`start_service` 的参数和 `start-rag-servers.ps1`。
 - 基目录在运行时解析：当前工作目录 → 可执行文件同级目录 → `E:\LlamaModels`（见 `resolve_base_dir`）。
 - 仅支持 Windows：使用 `std::os::windows::process::CommandExt` 与 `CREATE_NO_WINDOW` 隐藏子进程窗口，
   其他平台构建失败是预期行为，不要为跨平台做改造。
