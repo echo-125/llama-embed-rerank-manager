@@ -5,12 +5,18 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
 
 use crate::lang::Language;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// 运行日志的最大条数：超出后丢弃最旧的一条。
+const MAX_LOG_ITEMS: usize = 500;
+
+/// 重启时停止与启动之间的等待时间：让操作系统释放监听端口。
+const RESTART_DELAY: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceType {
@@ -58,6 +64,8 @@ impl ServiceType {
     /// - `-b`/`-ub` 统一为 512：embedding 模式下 llama-server 会把
     ///   `n_batch` 强制回 `n_ubatch`，显式写死既能消除启动告警，也能
     ///   让两条启动路径的显存峰值一致。
+    ///
+    /// 启动时完整命令行会写入运行日志，可与脚本逐项比对，防止两边漂移。
     pub fn extra_args(&self) -> Vec<&'static str> {
         match self {
             ServiceType::Embedding => vec![
@@ -137,27 +145,14 @@ pub struct ServiceManager {
     lang: Language,
     pub services: Vec<ServiceInstance>,
     pub logs: Arc<Mutex<VecDeque<LogItem>>>,
+    /// 复用的进程表查询句柄：只按需刷新目标 PID，不在每次查询时全量遍历。
+    sys: System,
+    /// 已登记、等待到点执行的延迟重启（服务下标, 就绪时刻）。
+    pending_restarts: Vec<(usize, Instant)>,
 }
 
 pub fn service_pid_file(base_dir: &Path, svc_type: ServiceType) -> PathBuf {
     base_dir.join(format!("{}.pid", svc_type.name().to_lowercase()))
-}
-
-pub fn read_service_pid_file(base_dir: &Path, svc_type: ServiceType) -> Option<u32> {
-    let path = service_pid_file(base_dir, svc_type);
-    if let Ok(content) = fs::read_to_string(&path) {
-        if let Ok(pid) = content.trim().parse::<u32>() {
-            let mut sys = System::new();
-            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-            if let Some(proc) = sys.process(Pid::from_u32(pid)) {
-                let name = proc.name().to_string_lossy().to_lowercase();
-                if name.contains("llama") {
-                    return Some(pid);
-                }
-            }
-        }
-    }
-    None
 }
 
 impl ServiceManager {
@@ -178,7 +173,7 @@ impl ServiceManager {
             })
             .collect();
 
-        let logs = Arc::new(Mutex::new(VecDeque::with_capacity(500)));
+        let logs = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOG_ITEMS)));
 
         let mut mgr = Self {
             base_dir,
@@ -186,6 +181,8 @@ impl ServiceManager {
             lang,
             services,
             logs,
+            sys: System::new(),
+            pending_restarts: Vec::new(),
         };
         mgr.sync_with_existing_processes();
         mgr
@@ -239,26 +236,55 @@ impl ServiceManager {
     }
 
     pub fn append_log(&self, service: &'static str, level: LogLevel, text: String) {
-        if let Ok(mut l) = self.logs.lock() {
-            if l.len() >= 500 {
-                l.pop_front();
-            }
-            l.push_back(LogItem {
-                service,
-                level,
-                text,
-            });
+        push_log(&self.logs, service, level, text);
+    }
+
+    /// 读取 PID 文件并确认对应进程仍在运行。
+    ///
+    /// 文件格式为两行：第一行 PID，第二行启动时实际使用的端口。旧版本只写了
+    /// PID，此时端口返回 0，由调用方回退到当前配置端口。进程不存在或名称不含
+    /// "llama"（PID 被其它程序复用）时返回 None。
+    fn read_pid_file(&mut self, base_dir: &Path, svc_type: ServiceType) -> Option<(u32, u16)> {
+        let content = fs::read_to_string(service_pid_file(base_dir, svc_type)).ok()?;
+        let mut lines = content.lines();
+        let pid: u32 = lines.next()?.trim().parse().ok()?;
+        let port: u16 = lines
+            .next()
+            .and_then(|line| line.trim().parse().ok())
+            .unwrap_or(0);
+        if !self.llama_process_alive(pid) {
+            return None;
         }
+        Some((pid, port))
+    }
+
+    /// 按 PID 精准刷新进程表，判断是否是存活的 llama 进程。
+    ///
+    /// 只刷新目标 PID，不为单次查询全量遍历进程表；名称含 "llama" 的判断用于
+    /// 防止 PID 被复用后把别的程序误判成仍在运行的服务。
+    fn llama_process_alive(&mut self, pid: u32) -> bool {
+        self.sys
+            .refresh_processes(sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
+        self.sys
+            .process(Pid::from_u32(pid))
+            .map(|proc| {
+                proc.name()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains("llama")
+            })
+            .unwrap_or(false)
     }
 
     pub fn sync_with_existing_processes(&mut self) {
-        let base_dir = &self.base_dir;
-        for svc in &mut self.services {
+        let base_dir = self.base_dir.clone();
+        for idx in 0..self.services.len() {
+            let svc_type = self.services[idx].config.service_type;
             let mut child_exited = false;
             let mut exit_err = None;
 
             // 1. 如果持有子进程句柄，实时检查其真实退出状态（防止参数错误闪退导致卡在启动中）
-            if let Some(ref mut child) = svc.child {
+            if let Some(ref mut child) = self.services[idx].child {
                 match child.try_wait() {
                     Ok(Some(status)) => {
                         child_exited = true;
@@ -283,54 +309,69 @@ impl ServiceManager {
             }
 
             if child_exited {
-                svc.child = None;
-                let _ = fs::remove_file(service_pid_file(base_dir, svc.config.service_type));
+                self.services[idx].child = None;
+                let _ = fs::remove_file(service_pid_file(&base_dir, svc_type));
                 if let Some(err) = exit_err {
-                    svc.status = ServiceStatus::Failed(err);
+                    self.services[idx].status = ServiceStatus::Failed(err);
                 } else {
-                    svc.status = ServiceStatus::Stopped;
+                    self.services[idx].status = ServiceStatus::Stopped;
                 }
                 continue;
             }
 
-            // 2. 检查 PID 文件与操作系统真实进程状态
-            let pid_opt = if let Some(ref child) = svc.child {
-                Some(child.id())
+            // 2. 确定进程 PID 与它实际监听的端口：
+            //    - 本程序拉起的子进程用当前配置端口；
+            //    - PID 文件收养的进程（脚本启动或上次运行残留）用文件里记录的端口。
+            //      否则端口变更后重启 GUI 会一直探不到健康检查，卡在“启动中”。
+            let child_pid = self.services[idx].child.as_ref().map(|c| c.id());
+            let (pid, health_port) = if let Some(pid) = child_pid {
+                (pid, self.services[idx].config.port)
             } else {
-                read_service_pid_file(base_dir, svc.config.service_type)
-            };
-
-            if let Some(pid) = pid_opt {
-                if test_health(svc.config.port) {
-                    svc.status = ServiceStatus::Running { pid };
-                } else {
-                    let mut sys = System::new();
-                    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-                    if sys.process(Pid::from_u32(pid)).is_some() {
-                        svc.status = ServiceStatus::Starting { pid };
-                    } else {
-                        // 进程已死亡，更新为失败状态
-                        svc.child = None;
-                        let _ =
-                            fs::remove_file(service_pid_file(base_dir, svc.config.service_type));
-                        svc.status = ServiceStatus::Failed(
-                            self.lang
-                                .t(
-                                    "进程已崩溃退出，请查看日志",
-                                    "Process exited unexpectedly; check the logs",
-                                )
-                                .to_string(),
-                        );
+                match self.read_pid_file(&base_dir, svc_type) {
+                    Some((pid, port)) => {
+                        let port = if port == 0 {
+                            self.services[idx].config.port
+                        } else {
+                            port
+                        };
+                        // 以进程真实端口为准，保证界面显示与实际监听一致。
+                        if port != self.services[idx].config.port {
+                            self.services[idx].config.port = port;
+                        }
+                        (pid, port)
+                    }
+                    None => {
+                        // 没有 PID 文件、进程已退出或 PID 被复用：按停止处理，
+                        // 并清理失效的 PID 文件。
+                        if matches!(
+                            self.services[idx].status,
+                            ServiceStatus::Starting { .. } | ServiceStatus::Running { .. }
+                        ) {
+                            self.services[idx].status = ServiceStatus::Stopped;
+                        }
+                        let _ = fs::remove_file(service_pid_file(&base_dir, svc_type));
+                        continue;
                     }
                 }
+            };
+
+            // 3. 健康检查 + 进程存活兜底
+            if test_health(health_port) {
+                self.services[idx].status = ServiceStatus::Running { pid };
+            } else if self.llama_process_alive(pid) {
+                self.services[idx].status = ServiceStatus::Starting { pid };
             } else {
-                if matches!(
-                    svc.status,
-                    ServiceStatus::Starting { .. } | ServiceStatus::Running { .. }
-                ) {
-                    svc.status = ServiceStatus::Stopped;
-                }
-                let _ = fs::remove_file(service_pid_file(base_dir, svc.config.service_type));
+                // 进程已死亡，更新为失败状态
+                self.services[idx].child = None;
+                let _ = fs::remove_file(service_pid_file(&base_dir, svc_type));
+                self.services[idx].status = ServiceStatus::Failed(
+                    self.lang
+                        .t(
+                            "进程已崩溃退出，请查看日志",
+                            "Process exited unexpectedly; check the logs",
+                        )
+                        .to_string(),
+                );
             }
         }
     }
@@ -342,6 +383,9 @@ impl ServiceManager {
                 .t("无效的模型索引", "Invalid model index")
                 .to_string());
         }
+
+        // 手动启动会取代之前登记的延迟重启。
+        self.pending_restarts.retain(|(i, _)| *i != idx);
 
         if let Some(port) = self.services[idx].pending_port.take() {
             self.services[idx].config.port = port;
@@ -378,6 +422,18 @@ impl ServiceManager {
             return Err(err);
         }
 
+        // 模型文件名只允许是模型目录内的普通文件名：拒绝路径分隔符，
+        // 避免配置被手工改成 "../x.gguf" 之类时逃出模型目录。
+        if model_file.contains(['\\', '/']) {
+            let err = if self.lang.is_zh() {
+                format!("模型文件名无效: {model_file}")
+            } else {
+                format!("Invalid model file name: {model_file}")
+            };
+            self.services[idx].status = ServiceStatus::Failed(err.clone());
+            return Err(err);
+        }
+
         let model_path = self.base_dir.join(&model_file);
         if !model_path.exists() {
             let err = if self.lang.is_zh() {
@@ -389,29 +445,41 @@ impl ServiceManager {
             return Err(err);
         }
 
+        // 启动前探测端口：已被占用时给出明确错误，而不是让 llama-server
+        // bind 失败后闪退、只留下一个看不懂的退出码。
+        if std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_err() {
+            let err = if self.lang.is_zh() {
+                format!("端口 {port} 已被占用，请更换端口或停止占用该端口的程序")
+            } else {
+                format!("Port {port} is already in use. Pick another port or stop the program using it.")
+            };
+            self.services[idx].status = ServiceStatus::Failed(err.clone());
+            return Err(err);
+        }
+
         let log_dir = self.base_dir.join("logs");
         let _ = fs::create_dir_all(&log_dir);
 
         // 核心修复：llama.exe 属于子命令模式，必须传递 'serve' 作为第一个参数
+        let mut args: Vec<String> = vec![
+            "serve".to_string(),
+            "-m".to_string(),
+            model_path.to_string_lossy().to_string(),
+            "--host".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+            port.to_string(),
+            "--no-ui".to_string(),
+            "--alias".to_string(),
+            model_alias(&model_file),
+        ];
+        args.extend(svc_type.extra_args().into_iter().map(String::from));
+
         let mut cmd = Command::new(&llama_exe);
-        cmd.arg("serve")
-            .arg("-m")
-            .arg(&model_path)
-            .arg("--host")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--no-ui")
-            .arg("--alias")
-            .arg(model_alias(&model_file));
-
-        for arg in svc_type.extra_args() {
-            cmd.arg(arg);
-        }
-
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW);
 
         let mut child = match cmd.spawn() {
             Ok(child) => child,
@@ -427,60 +495,18 @@ impl ServiceManager {
         };
         let pid = child.id();
 
+        // PID 文件记录 PID 与实际端口：重启 GUI 后收养进程时用它做健康检查，
+        // 避免端口变更后探错端口、状态卡在“启动中”。
         let pid_file = service_pid_file(&self.base_dir, svc_type);
-        let _ = fs::write(&pid_file, pid.to_string());
+        let _ = fs::write(&pid_file, format!("{pid}\n{port}"));
 
-        let logs_stdout = self.logs.clone();
+        let logs = self.logs.clone();
         let svc_name = svc_type.name();
         if let Some(stdout) = child.stdout.take() {
-            std::thread::spawn(move || {
-                let reader = BufReader::new(stdout);
-                for line in reader.lines().flatten() {
-                    let level = if line.contains("error") || line.contains("Error") {
-                        LogLevel::Error
-                    } else if line.contains("warn") || line.contains("warning") {
-                        LogLevel::Warn
-                    } else {
-                        LogLevel::Info
-                    };
-                    if let Ok(mut l) = logs_stdout.lock() {
-                        if l.len() >= 500 {
-                            l.pop_front();
-                        }
-                        l.push_back(LogItem {
-                            service: svc_name,
-                            level,
-                            text: line,
-                        });
-                    }
-                }
-            });
+            spawn_log_pump(logs.clone(), svc_name, stdout);
         }
-
-        let logs_stderr = self.logs.clone();
         if let Some(stderr) = child.stderr.take() {
-            std::thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines().flatten() {
-                    let level = if line.contains("error") || line.contains("Error") {
-                        LogLevel::Error
-                    } else if line.contains("warn") || line.contains("warning") {
-                        LogLevel::Warn
-                    } else {
-                        LogLevel::Info
-                    };
-                    if let Ok(mut l) = logs_stderr.lock() {
-                        if l.len() >= 500 {
-                            l.pop_front();
-                        }
-                        l.push_back(LogItem {
-                            service: svc_name,
-                            level,
-                            text: line,
-                        });
-                    }
-                }
-            });
+            spawn_log_pump(logs, svc_name, stderr);
         }
 
         self.services[idx].child = Some(child);
@@ -496,6 +522,17 @@ impl ServiceManager {
             },
         );
 
+        // 完整命令行入日志：既可复现启动，也便于与 start-rag-servers.ps1 的参数比对。
+        self.append_log(
+            svc_type.name(),
+            LogLevel::Info,
+            if self.lang.is_zh() {
+                format!("启动命令: {} {}", llama_exe.display(), args.join(" "))
+            } else {
+                format!("Launch command: {} {}", llama_exe.display(), args.join(" "))
+            },
+        );
+
         Ok(())
     }
 
@@ -505,16 +542,20 @@ impl ServiceManager {
         }
         let svc_type = self.services[idx].config.service_type;
 
+        // 手动停止后不再执行之前登记的延迟重启。
+        self.pending_restarts.retain(|(i, _)| *i != idx);
+
         if let Some(mut child) = self.services[idx].child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
 
-        if let Some(pid) = read_service_pid_file(&self.base_dir, svc_type) {
+        let base_dir = self.base_dir.clone();
+        if let Some((pid, _)) = self.read_pid_file(&base_dir, svc_type) {
             kill_pid(pid);
         }
 
-        let _ = fs::remove_file(service_pid_file(&self.base_dir, svc_type));
+        let _ = fs::remove_file(service_pid_file(&base_dir, svc_type));
         if let Some(port) = self.services[idx].pending_port.take() {
             self.services[idx].config.port = port;
         }
@@ -527,10 +568,42 @@ impl ServiceManager {
         );
     }
 
+    /// 请求重启：先停止，再登记一个延迟启动。
+    ///
+    /// 停止与启动之间需要等待操作系统释放监听端口；等待不在调用线程（UI 线程）
+    /// 里进行，而是由 `process_pending_restarts` 在界面刷新循环里到点执行。
     pub fn restart_service(&mut self, idx: usize) -> Result<(), String> {
+        if idx >= self.services.len() {
+            return Err(self
+                .lang
+                .t("无效的模型索引", "Invalid model index")
+                .to_string());
+        }
         self.stop_service(idx);
-        std::thread::sleep(Duration::from_millis(300));
-        self.start_service(idx)
+        self.pending_restarts
+            .push((idx, Instant::now() + RESTART_DELAY));
+        Ok(())
+    }
+
+    /// 执行所有就绪的延迟重启，返回 `(服务下标, 启动结果)`。
+    pub fn process_pending_restarts(&mut self) -> Vec<(usize, Result<(), String>)> {
+        let now = Instant::now();
+        let mut due = Vec::new();
+        let mut still_pending = Vec::new();
+        for (idx, ready_at) in self.pending_restarts.drain(..) {
+            if idx >= self.services.len() {
+                continue;
+            }
+            if now >= ready_at {
+                due.push(idx);
+            } else {
+                still_pending.push((idx, ready_at));
+            }
+        }
+        self.pending_restarts = still_pending;
+        due.into_iter()
+            .map(|idx| (idx, self.start_service(idx)))
+            .collect()
     }
 
     /// 启动所有未运行的服务。
@@ -559,6 +632,7 @@ impl ServiceManager {
     }
 
     pub fn stop_all(&mut self) {
+        self.pending_restarts.clear();
         for i in 0..self.services.len() {
             self.stop_service(i);
         }
@@ -632,6 +706,62 @@ impl ServiceManager {
     }
 }
 
+/// 向日志队列追加一条记录；队列有界，超出容量时丢弃最旧的一条。
+fn push_log(
+    logs: &Arc<Mutex<VecDeque<LogItem>>>,
+    service: &'static str,
+    level: LogLevel,
+    text: String,
+) {
+    if let Ok(mut l) = logs.lock() {
+        if l.len() >= MAX_LOG_ITEMS {
+            l.pop_front();
+        }
+        l.push_back(LogItem {
+            service,
+            level,
+            text,
+        });
+    }
+}
+
+/// 按内容推断日志级别：llama-server 没有结构化级别，只能匹配关键词。
+fn classify_log_level(line: &str) -> LogLevel {
+    let lower = line.to_lowercase();
+    if lower.contains("error") {
+        LogLevel::Error
+    } else if lower.contains("warn") {
+        LogLevel::Warn
+    } else {
+        LogLevel::Info
+    }
+}
+
+/// 启动一条输出管道（stdout/stderr）的日志泵线程：逐行读取直至管道关闭。
+fn spawn_log_pump<R: std::io::Read + Send + 'static>(
+    logs: Arc<Mutex<VecDeque<LogItem>>>,
+    service: &'static str,
+    pipe: R,
+) {
+    std::thread::spawn(move || {
+        let reader = BufReader::new(pipe);
+        for line in reader.lines() {
+            let text = match line {
+                Ok(text) => text,
+                // 非 UTF-8 输出（如二进制进度信息）不静默丢弃，记录一条占位说明。
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    push_log(&logs, service, LogLevel::Warn, "<non-utf8 output>".to_string());
+                    continue;
+                }
+                // 其它读取错误（管道断裂等）结束本路日志。
+                Err(_) => break,
+            };
+            let level = classify_log_level(&text);
+            push_log(&logs, service, level, text);
+        }
+    });
+}
+
 pub fn test_health(port: u16) -> bool {
     let url = format!("http://127.0.0.1:{}/health", port);
     let agent = ureq::Agent::config_builder()
@@ -686,7 +816,15 @@ pub fn find_llama_exe() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::model_alias;
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("llama-rag-svc-test-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn model_alias_strips_gguf_extension() {
@@ -695,5 +833,73 @@ mod tests {
             "Qwen3-Embedding-4B-Q6_K"
         );
         assert_eq!(model_alias("no-extension"), "no-extension");
+    }
+
+    #[test]
+    fn classifies_log_levels_by_keyword() {
+        assert_eq!(classify_log_level("server started"), LogLevel::Info);
+        assert_eq!(
+            classify_log_level("main: warning: deprecated"),
+            LogLevel::Warn
+        );
+        assert_eq!(
+            classify_log_level("Error: failed to load"),
+            LogLevel::Error
+        );
+        // 大小写不敏感；"warning" 以 "warn" 命中
+        assert_eq!(classify_log_level("failed with ERROR code"), LogLevel::Error);
+    }
+
+    #[test]
+    fn restart_is_deferred_until_ready() {
+        let dir = temp_dir("restart");
+        let mut mgr = ServiceManager::new(&dir, None, Language::Zh);
+
+        // 重启先停止并登记延迟启动；就绪前不应真正启动。
+        mgr.restart_service(0).unwrap();
+        assert_eq!(mgr.pending_restarts.len(), 1);
+        assert!(mgr.process_pending_restarts().is_empty());
+        assert_eq!(mgr.pending_restarts.len(), 1);
+        // 没有 llama.exe，到点启动也只会失败，但条目必须被消费掉。
+        mgr.pending_restarts[0].1 = Instant::now() - Duration::from_secs(1);
+        let results = mgr.process_pending_restarts();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.is_err());
+        assert!(mgr.pending_restarts.is_empty());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stop_cancels_pending_restart() {
+        let dir = temp_dir("stop-cancel");
+        let mut mgr = ServiceManager::new(&dir, None, Language::Zh);
+
+        mgr.restart_service(1).unwrap();
+        assert_eq!(mgr.pending_restarts.len(), 1);
+        mgr.stop_service(1);
+        assert!(mgr.pending_restarts.is_empty());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unreadable_pid_files_are_ignored() {
+        let dir = temp_dir("pid");
+        let mut mgr = ServiceManager::new(&dir, None, Language::Zh);
+
+        // 内容无法解析
+        fs::write(service_pid_file(&dir, ServiceType::Embedding), "not-a-pid").unwrap();
+        assert!(mgr.read_pid_file(&dir, ServiceType::Embedding).is_none());
+
+        // PID 不存在（或存在但不是 llama 进程）
+        fs::write(
+            service_pid_file(&dir, ServiceType::Embedding),
+            "999999999\n9932",
+        )
+        .unwrap();
+        assert!(mgr.read_pid_file(&dir, ServiceType::Embedding).is_none());
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

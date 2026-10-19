@@ -109,7 +109,19 @@ impl AppConfig {
     pub fn save(&self, base_dir: &Path) -> Result<(), String> {
         let text = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize config: {e}"))?;
-        fs::write(config_path(base_dir), text).map_err(|e| format!("Failed to write config: {e}"))
+        let path = config_path(base_dir);
+        // 原子写入：先写 `<path>.part` 再改名，避免崩溃时留下半个配置文件。
+        // 损坏的 config.json 会在下次加载时被静默重置为默认值，用户设置全部丢失，
+        // 因此这里必须保证 config.json 要么是旧全文、要么是新全文。
+        let mut temp_name = path.as_os_str().to_os_string();
+        temp_name.push(".part");
+        let temp_path = PathBuf::from(temp_name);
+        fs::write(&temp_path, text).map_err(|e| format!("Failed to write config: {e}"))?;
+        if let Err(e) = fs::rename(&temp_path, &path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(format!("Failed to write config: {e}"));
+        }
+        Ok(())
     }
 }
 
@@ -133,6 +145,8 @@ mod tests {
             ..Default::default()
         };
         config.save(&dir).unwrap();
+        // 原子写入成功后不应留下 .part 临时文件
+        assert!(!dir.join("config.json.part").exists());
 
         let loaded = AppConfig::load(&dir);
         assert_eq!(loaded.embedding_port, 10032);

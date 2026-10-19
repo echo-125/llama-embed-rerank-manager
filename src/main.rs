@@ -383,6 +383,16 @@ impl eframe::App for RagGuiApp {
             self.refresh_models();
         }
 
+        // 到点的延迟重启在此真正启动：等待端口释放不在 UI 线程上进行。
+        for (_idx, result) in self.service_mgr.process_pending_restarts() {
+            if let Err(e) = result {
+                self.set_status(
+                    format!("{}: {e}", lang.t("重启失败", "Restart failed")),
+                    true,
+                );
+            }
+        }
+
         // 后台模型导入完成时回写状态（复制在独立线程中，不阻塞 UI）。
         let import_finished = self
             .import_job
@@ -647,6 +657,9 @@ impl RagGuiApp {
 
         card_frame(self.config.dark_mode).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
+            // 同时限制最大宽度：否则内容超出可用宽度时卡片会一起变宽，把右侧
+            // 控件挤出可见区域（高 DPI 下逻辑宽度偏小时尤其明显）。
+            ui.set_max_width(ui.available_width());
             ui.horizontal(|ui| {
                 section_title(ui, p, lang.t("资源占用", "Resource usage"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -764,6 +777,9 @@ impl RagGuiApp {
 
         card_frame(self.config.dark_mode).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
+            // 同时限制最大宽度：否则内容超出可用宽度时卡片会一起变宽，把右侧
+            // 控件挤出可见区域（高 DPI 下逻辑宽度偏小时尤其明显）。
+            ui.set_max_width(ui.available_width());
             ui.horizontal(|ui| {
                 section_title(ui, p, lang.t("模型控制", "Model control"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -866,8 +882,11 @@ impl RagGuiApp {
                     } else {
                         short_model_name(&selected_model)
                     };
+                    // 下拉框宽度按行内剩余空间自适应：窗口较窄时收缩下拉框，
+                    // 保证右侧「启动 / API」按钮不被挤出可见区域。
+                    let combo_width = (ui.available_width() - 130.0).clamp(150.0, 260.0);
                     let combo = egui::ComboBox::from_id_salt(format!("combo_svc_{i}"))
-                        .width(260.0)
+                        .width(combo_width)
                         .selected_text(RichText::new(selected_model_label).size(11.0).color(p.text))
                         .show_ui(ui, |ui| {
                             for model_name in options {
@@ -1017,7 +1036,8 @@ impl RagGuiApp {
                     true,
                 );
             } else {
-                self.set_status(lang.t("模型已成功重启", "Model restarted"), false);
+                // 真正的启动由延迟重启到点执行，这里只确认指令已接受。
+                self.set_status(lang.t("模型正在重启…", "Restarting model…"), false);
             }
         }
         if let Some(idx) = action_test {
@@ -1044,6 +1064,9 @@ impl RagGuiApp {
 
         card_frame(self.config.dark_mode).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
+            // 同时限制最大宽度：否则内容超出可用宽度时卡片会一起变宽，把右侧
+            // 控件挤出可见区域（高 DPI 下逻辑宽度偏小时尤其明显）。
+            ui.set_max_width(ui.available_width());
             ui.horizontal(|ui| {
                 section_title(ui, p, lang.t("模型文件", "Model files"));
                 ui.label(
@@ -1134,16 +1157,19 @@ impl RagGuiApp {
                 .collect();
 
             let render_table = |ui: &mut egui::Ui, to_delete: &mut Option<String>| {
-                const COL_FILE: f32 = 320.0;
                 const COL_TYPE: f32 = 90.0;
                 const COL_SIZE: f32 = 80.0;
                 const COL_DIM: f32 = 80.0;
                 const COL_ACTION: f32 = 60.0;
+                // 文件列吃掉剩余宽度：窗口较窄时自动收缩，保证操作列不被裁掉。
+                let col_file = (ui.available_width()
+                    - (COL_TYPE + COL_SIZE + COL_DIM + COL_ACTION + 40.0))
+                    .clamp(140.0, 320.0);
 
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     for (width, header) in [
-                        (COL_FILE, lang.t("文件名称", "File")),
+                        (col_file, lang.t("文件名称", "File")),
                         (COL_TYPE, lang.t("模型类型", "Type")),
                         (COL_SIZE, lang.t("大小", "Size")),
                         (COL_DIM, lang.t("维度", "Dim")),
@@ -1178,7 +1204,7 @@ impl RagGuiApp {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 10.0;
 
-                        table_cell(ui, COL_FILE, |ui| {
+                        table_cell(ui, col_file, |ui| {
                             ui.label(
                                 RichText::new(&model.file_name)
                                     .size(12.0)
@@ -1338,6 +1364,9 @@ impl RagGuiApp {
 
         card_frame(self.config.dark_mode).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
+            // 同时限制最大宽度：否则内容超出可用宽度时卡片会一起变宽，把右侧
+            // 控件挤出可见区域（高 DPI 下逻辑宽度偏小时尤其明显）。
+            ui.set_max_width(ui.available_width());
             ui.horizontal(|ui| {
                 section_title(ui, p, lang.t("日志", "Logs"));
                 ui.add_space(4.0);
@@ -1821,6 +1850,9 @@ impl RagGuiApp {
                 // 1. 服务端口
                 card_frame(dark).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
+            // 同时限制最大宽度：否则内容超出可用宽度时卡片会一起变宽，把右侧
+            // 控件挤出可见区域（高 DPI 下逻辑宽度偏小时尤其明显）。
+            ui.set_max_width(ui.available_width());
                     section_title(ui, p, lang.t("模型端口", "Model ports"));
                     ui.add_space(4.0);
 
@@ -1867,6 +1899,9 @@ impl RagGuiApp {
                 // 2. llama.exe 路径
                 card_frame(dark).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
+            // 同时限制最大宽度：否则内容超出可用宽度时卡片会一起变宽，把右侧
+            // 控件挤出可见区域（高 DPI 下逻辑宽度偏小时尤其明显）。
+            ui.set_max_width(ui.available_width());
                     ui.horizontal(|ui| {
                         section_title(ui, p, lang.t("llama.exe 路径", "llama.exe path"));
                         ui.add_space(4.0);
@@ -1923,6 +1958,9 @@ impl RagGuiApp {
                 // 3. 环境信息
                 card_frame(dark).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
+            // 同时限制最大宽度：否则内容超出可用宽度时卡片会一起变宽，把右侧
+            // 控件挤出可见区域（高 DPI 下逻辑宽度偏小时尤其明显）。
+            ui.set_max_width(ui.available_width());
                     section_title(ui, p, lang.t("环境信息", "Environment"));
                     ui.add_space(4.0);
 
@@ -1968,6 +2006,9 @@ impl RagGuiApp {
                 // 4. 模型下载与安装说明
                 card_frame(dark).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
+            // 同时限制最大宽度：否则内容超出可用宽度时卡片会一起变宽，把右侧
+            // 控件挤出可见区域（高 DPI 下逻辑宽度偏小时尤其明显）。
+            ui.set_max_width(ui.available_width());
                     section_title(ui, p, lang.t("模型下载与安装", "Model downloads"));
                     ui.add_space(4.0);
                     ui.label(
@@ -2003,6 +2044,9 @@ impl RagGuiApp {
                 // 5. 行为偏好
                 card_frame(dark).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
+            // 同时限制最大宽度：否则内容超出可用宽度时卡片会一起变宽，把右侧
+            // 控件挤出可见区域（高 DPI 下逻辑宽度偏小时尤其明显）。
+            ui.set_max_width(ui.available_width());
                     section_title(ui, p, lang.t("行为偏好", "Behavior"));
                     ui.add_space(4.0);
                     ui.checkbox(
@@ -2274,18 +2318,26 @@ fn section_title(ui: &mut egui::Ui, p: theme::Palette, text: &str) {
 fn configure_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
-    let font_path = std::path::Path::new(r"C:\Windows\Fonts\msyh.ttc");
-    if let Ok(font_data) = std::fs::read(font_path) {
-        fonts.font_data.insert(
-            "msyh".to_owned(),
-            Arc::new(egui::FontData::from_owned(font_data)),
-        );
+    // 依次尝试常见的中文字体文件；都不可用时保持 egui 默认字体。
+    const FONT_CANDIDATES: [&str; 3] = [
+        r"C:\Windows\Fonts\msyh.ttc",   // 微软雅黑
+        r"C:\Windows\Fonts\simhei.ttf", // 中易黑体
+        r"C:\Windows\Fonts\simsun.ttc", // 中易宋体
+    ];
+    for font_path in FONT_CANDIDATES {
+        if let Ok(font_data) = std::fs::read(font_path) {
+            fonts.font_data.insert(
+                "cjk".to_owned(),
+                Arc::new(egui::FontData::from_owned(font_data)),
+            );
 
-        if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-            family.insert(0, "msyh".to_owned());
-        }
-        if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-            family.insert(0, "msyh".to_owned());
+            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                family.insert(0, "cjk".to_owned());
+            }
+            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                family.insert(0, "cjk".to_owned());
+            }
+            break;
         }
     }
 

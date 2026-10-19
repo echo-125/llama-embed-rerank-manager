@@ -70,6 +70,12 @@ llama.cpp（`llama-server`）的两个检索服务 —— 文本向量化（默�
   若该模型被停止中的服务选中会同时清空选择。页面提供「恢复已移除」入口。
 - **接入模型名**：启动时传 `--alias`，值为所选模型文件名去掉 `.gguf`；API 弹窗展示同一名称。改规则要同步
   `model_alias`、`start_service` 的参数和 `start-rag-servers.ps1`。
+- **PID 文件格式**：`{service}.pid` 为两行，第一行 PID，第二行启动时实际使用的端口。重启 GUI 后通过 PID 文件
+  收养进程时按文件里的端口做健康检查，因此不能只写 PID。
+- **启动命令日志**：`start_service` 会把完整 llama-server 命令行写入运行日志，既是复现依据，也是与
+  `start-rag-servers.ps1` 的 `$services` 比对推理参数、发现两边漂移的第一手材料。
+- **延迟重启**：`restart_service` 只停止并登记 300ms 延迟，真正的启动由 UI 循环调用
+  `process_pending_restarts` 到点执行；不在 UI 线程上 sleep。手动 stop/start 会取消未决重启。
 - 基目录在运行时解析：当前工作目录 → 可执行文件同级目录 → `E:\LlamaModels`（见 `resolve_base_dir`）。
 - 仅支持 Windows：使用 `std::os::windows::process::CommandExt` 与 `CREATE_NO_WINDOW` 隐藏子进程窗口，
   其他平台构建失败是预期行为，不要为跨平台做改造。
@@ -91,8 +97,8 @@ llama.cpp（`llama-server`）的两个检索服务 —— 文本向量化（默�
 
 ## Testing instructions
 
-- `cargo test`：`src/config.rs`（配置读写、字段默认值）、`src/model_mgr.rs`（模型类型判断）与
-  `src/icon.rs`（图标资源字节数）。
+- `cargo test`：`src/config.rs`（配置读写、字段默认值）、`src/model_mgr.rs`（模型类型判断、导入复制）、
+  `src/service.rs`（模型别名、日志分级、延迟重启调度、PID 文件解析）与 `src/icon.rs`（图标资源字节数）。
 - 新增测试放在对应模块的 `#[cfg(test)] mod tests`。
 - 手工验证见 README 的「快速验证」：两个服务分别 `/health`，再调用 `/v1/embeddings` 与 `/v1/rerank`。
 - 涉及端口、模型切换、服务参数、主题/语言切换的改动，必须实际启停一次服务并逐项验证。
@@ -100,8 +106,7 @@ llama.cpp（`llama-server`）的两个检索服务 —— 文本向量化（默�
 
 ## PR & commit conventions
 
-- 从 `master` 分支开发；仓库目前仍无任何提交，首次提交请确认是否直接落在 `master`
-- 提交信息用 conventional commits（`feat:` / `fix:` / `docs:` / `refactor:`）
+- 从 `master` 分支开发；提交信息用 conventional commits（`feat:` / `fix:` / `docs:` / `refactor:`）
 - `.gitignore` 已忽略 `/target`、`/llama-rag-gui.exe`、`/config.json`、`*.gguf`、`*.part`、`/logs/`、
   `/*.pid`、`/start-rag-servers.ps1`、`/start-rag-servers.cmd`、`/gguf-info.ps1`、`/.ref-m3u8/`。
   即便如此仍请显式 `git add <file>`，不要 `git add -A`
