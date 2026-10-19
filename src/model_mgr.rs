@@ -20,17 +20,16 @@ const CANCEL_CHECK_CHUNKS: usize = 64;
 /// 重排模型在 GGUF 里没有专用字段：Qwen3-Reranker、bge-reranker、bge-m3 都带
 /// `<arch>.embedding_length`，因此**不能**用「有 embedding_length」判定向量模型，
 /// 否则全部模型都会被判成 Embedding。
-const RERANK_NAME_HINTS: &[&str] = &[
-    "rerank",
-    "reranker",
-    "cross-encoder",
-    "cross_encoder",
-    "bge-m3",
-];
+/// 文件名兜底关键词：只在元数据完全给不出结论时使用（精简 GGUF / 旧版本）。
+///
+/// 注意不要把 `bge-m3` 放进重排列表：bge-m3 是向量模型（pooling_type = mean），
+/// 真正的重排器是独立的 `bge-reranker-v2-m3`。
+const RERANK_NAME_HINTS: &[&str] = &["rerank", "reranker", "cross-encoder", "cross_encoder"];
 
 /// 文件名里出现这些关键词时判为向量模型。
 const EMBED_NAME_HINTS: &[&str] = &[
     "embed",
+    "bge-m3",
     "bge-large",
     "bge-base",
     "bge-small",
@@ -63,8 +62,16 @@ struct ModelMeta {
     architecture: Option<String>,
     /// 向量维度（`<arch>.embedding_length`）。
     embedding_dim: Option<u32>,
+    /// 元数据里的池化方式（`<arch>.pooling_type`）：1 none / 2 mean / 3 cls / 4 last / 5 rank。
+    /// 有值时说明模型类别已确定（rank = 重排，其余 = 向量），优先级高于文件名。
+    pooling: Option<u32>,
     /// 元数据宣告了重排能力（`<arch>.pooling_type = rank` 或 `supports_rerank`）。
     rerank_capable: bool,
+    /// 存在重排分类头张量（`cls.*` / `classifier.*`）：重排模型的结构本质特征。
+    ///
+    /// 这是最可靠的判据 —— 有的重排模型（如 bge-reranker-v2-m3）元数据里没有任何重排
+    /// 标记、文件名也不一定带 rerank，但一定有分类头的权重张量。
+    classifier_head: bool,
 }
 
 /// 模型类型：导入与扫描时自动判定（GGUF 元数据 + 文件名），不需要用户手选。
@@ -91,25 +98,27 @@ impl ModelKind {
         }
     }
 
-    /// 结合 GGUF 元数据判断模型类型；扫描与导入都走这里，不需要用户手选。
+    /// 判断模型类型：**结构证据优先，文件名仅作兜底**。
     ///
-    /// 判定顺序：
-    /// 1. 元数据宣告了重排能力（`<arch>.pooling_type = rank` / `supports_rerank`）→ 重排；
-    /// 2. 文件名含重排关键词 → 重排；
-    /// 3. 文件名含向量关键词 → 向量；
-    /// 4. 都没有则判为其他（仍会列出，但不进入服务下拉）。
+    /// 判定顺序（从可靠到不可靠）：
     ///
-    /// 注意：`embedding_length` 不能作为向量模型的依据 —— 重排模型同样带这个字段；
-    /// 架构名也不参与子串匹配（`qwen3` 里含 `m3`，会误命中 `bge-m3`）。
+    /// 1. **分类头张量**（`cls.*` / `classifier.*`）→ Rerank。
+    ///    重排模型在主干外一定多一个打分头，这是它与同架构向量模型的结构本质差异，
+    ///    比文件名和元数据标记都可靠（bge-reranker 元数据里没有任何重排标记）。
+    /// 2. **`<arch>.pooling_type`**：`rank` → Rerank；`mean` / `cls` / `last` → Embedding。
+    ///    明确声明了池化方式的模型类别已经确定，不该再被文件名推翻。
+    /// 3. **文件名关键词**：只用于前两步都拿不到结论的模型（元数据缺失 / 精简 GGUF）。
+    ///
+    /// 注意：`embedding_length` 不能作为判据 —— 重排模型同样带该字段。
     pub fn classify_with_metadata(path: &Path, file_name: &str) -> Self {
-        let by_name = Self::classify(file_name);
-        if by_name == Self::Rerank {
+        let meta = read_model_meta(path);
+        if meta.classifier_head || meta.rerank_capable {
             return Self::Rerank;
         }
-        if read_model_meta(path).rerank_capable {
-            return Self::Rerank;
+        if meta.pooling.is_some() {
+            return Self::Embedding;
         }
-        by_name
+        Self::classify(file_name)
     }
 
     /// 该模型对应的服务类型；无法识别时为 None。
@@ -807,7 +816,7 @@ fn read_model_meta(path: &Path) -> ModelMeta {
     if version < 2 {
         return meta;
     }
-    let _tensor_count = read_u64(&mut reader);
+    let tensor_count = read_u64(&mut reader);
     let Some(kv_count) = read_u64(&mut reader) else {
         return meta;
     };
@@ -857,6 +866,7 @@ fn read_model_meta(path: &Path) -> ModelMeta {
             }
             _ if key.ends_with(".pooling_type") => match read_gguf_u32(&mut reader, value_type) {
                 Some(pooling) => {
+                    meta.pooling = Some(pooling);
                     if pooling == POOLING_TYPE_RANK {
                         meta.rerank_capable = true;
                     }
@@ -883,7 +893,63 @@ fn read_model_meta(path: &Path) -> ModelMeta {
         }
     }
 
+    // KV 段之后是张量信息表：这里只看张量名，用来识别重排分类头。
+    // 重排模型（bge-reranker、Qwen3-Reranker 等）都在主干之外多一个分类头，
+    // 这是它们与同样架构的向量模型在结构上的唯一确定差异。
+    if let Some(tensor_count) = tensor_count
+        && count_classifier_heads(&mut reader, tensor_count)
+    {
+        meta.classifier_head = true;
+    }
+
     meta
+}
+
+/// 扫描张量信息表，判断是否存在分类头（`cls.*` / `classifier.*`）。
+///
+/// 只读张量名与维度，不读权重数据，因此大模型也只消耗毫秒级时间。
+/// 判定为分类头的条件：张量名以 `cls.` 或 `classifier.` 开头，且最后一维很小（1 或 2）。
+/// 主干的 `attn_output` / `layer_output_norm` 等名称不匹配，不会误判。
+fn count_classifier_heads(reader: &mut BufReader<fs::File>, tensor_count: u64) -> bool {
+    for _ in 0..tensor_count.min(1_000_000) {
+        let Some(name_len) = read_u64(reader) else {
+            return false;
+        };
+        if name_len > 4096 {
+            return false;
+        }
+        let mut name = vec![0u8; name_len as usize];
+        if reader.read_exact(&mut name).is_err() {
+            return false;
+        }
+        let name = String::from_utf8_lossy(&name);
+        let Some(dim_count) = read_u32(reader) else {
+            return false;
+        };
+        if dim_count > 8 {
+            return false;
+        }
+        let mut dims = Vec::with_capacity(dim_count as usize);
+        for _ in 0..dim_count {
+            match read_u64(reader) {
+                Some(dim) => dims.push(dim),
+                None => return false,
+            }
+        }
+        let Some(_tensor_type) = read_u32(reader) else {
+            return false;
+        };
+        if read_u64(reader).is_none() {
+            return false;
+        }
+
+        let is_head = name.starts_with("cls.") || name.starts_with("classifier.");
+        let last_dim_small = dims.last().map(|d| *d <= 2).unwrap_or(false);
+        if is_head && last_dim_small {
+            return true;
+        }
+    }
+    false
 }
 
 /// 读取一个整数形式的 GGUF 标量（维度 / 池化类型）。
@@ -1209,58 +1275,44 @@ mod tests {
         bytes
     }
 
-    /// 带 `<arch>.embedding_length` 的 GGUF（真实向量 / 重排模型都长这样）。
-    fn gguf_with_embedding_length(dim: u32) -> Vec<u8> {
-        gguf_with_kvs(&[("qwen.embedding_length", 4, dim.to_le_bytes().to_vec())])
-    }
-
-    #[test]
-    fn reranker_with_embedding_length_is_still_rerank() {
-        // 实际踩过的坑：这些重排模型同样带 embedding_length，
-        // 只看元数据会把它们全判成 Embedding。
-        let dir = temp_dir("classify_rerank");
-        for name in [
-            "Qwen3-Reranker-0.6B-Q8_0.gguf",
-            "bge-reranker-v2-m3-F16.gguf",
-            "bge-m3-Q8_0.gguf",
-        ] {
-            let model = dir.join(name);
-            fs::write(&model, gguf_with_embedding_length(1024)).unwrap();
-            assert_eq!(
-                ModelKind::classify_with_metadata(&model, name),
-                ModelKind::Rerank,
-                "{name} 应判为重排"
-            );
+    /// 拼一个「KV + 张量表」的 GGUF，用于验证分类头识别。
+    ///
+    /// `tensors` 里每项是 `(张量名, 维度)`，张量类型固定为 F32、偏移为 0。
+    fn gguf_with_tensors(kvs: &[(&str, u32, Vec<u8>)], tensors: &[(&str, Vec<u64>)]) -> Vec<u8> {
+        let mut bytes = gguf_with_kvs(kvs);
+        // GGUF 头：magic(4) + version(4) 之后就是 tensor_count(8)
+        let tensor_count_at = 8;
+        bytes[tensor_count_at..tensor_count_at + 8]
+            .copy_from_slice(&(tensors.len() as u64).to_le_bytes());
+        for (name, dims) in tensors {
+            bytes.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for dim in dims {
+                bytes.extend_from_slice(&dim.to_le_bytes());
+            }
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // tensor type: F32
+            bytes.extend_from_slice(&0u64.to_le_bytes()); // offset
         }
-        fs::remove_dir_all(&dir).unwrap();
+        bytes
     }
 
     #[test]
-    fn embedding_model_with_embedding_length_stays_embedding() {
-        let dir = temp_dir("classify_embed");
-        let model = dir.join("Qwen3-Embedding-0.6B-Q8_0.gguf");
-        fs::write(&model, gguf_with_embedding_length(1024)).unwrap();
-        assert_eq!(
-            ModelKind::classify_with_metadata(&model, "Qwen3-Embedding-0.6B-Q8_0.gguf"),
-            ModelKind::Embedding
-        );
-        let meta = read_model_meta(&model);
-        assert_eq!(meta.embedding_dim, Some(1024));
-        assert!(!meta.rerank_capable);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn pooling_type_rank_marks_rerank_without_name_hint() {
-        let dir = temp_dir("classify_pooling");
+    fn classifier_head_marks_rerank_without_any_metadata_hint() {
+        // bge-reranker-v2-m3 的真实特征：没有 pooling_type、没有 rerank 标记，
+        // 只在主干外多一个 cls 分类头。
+        let dir = temp_dir("classifier_head");
         let model = dir.join("mystery-model.gguf");
         fs::write(
             &model,
-            gguf_with_kvs(&[
-                ("bert.embedding_length", 4, 768u32.to_le_bytes().to_vec()),
-                // 4 = rank（与 llama.cpp 的 llama_pooling_type 对齐）
-                ("bert.pooling_type", 4, 4u32.to_le_bytes().to_vec()),
-            ]),
+            gguf_with_tensors(
+                &[("bert.embedding_length", 4, 1024u32.to_le_bytes().to_vec())],
+                &[
+                    ("token_embd.weight", vec![1024, 1024]),
+                    ("cls.weight", vec![1024, 1024]),
+                    ("cls.output.weight", vec![1024, 1]),
+                ],
+            ),
         )
         .unwrap();
         assert_eq!(
@@ -1271,40 +1323,62 @@ mod tests {
     }
 
     #[test]
-    fn architecture_string_does_not_trigger_rerank() {
-        // qwen3 里含有 m3，若用架构名做子串匹配会误判成重排。
-        let dir = temp_dir("classify_arch");
-        let model = dir.join("plain-embed.gguf");
+    fn two_class_classifier_head_marks_rerank() {
+        // Qwen3-Reranker 的特征：cls.output.weight 形状为 (hidden, 2)。
+        let dir = temp_dir("classifier_head2");
+        let model = dir.join("qwen-like.gguf");
         fs::write(
             &model,
-            gguf_with_kvs(&[
-                ("general.architecture", 8, {
-                    let mut v = (5u64).to_le_bytes().to_vec();
-                    v.extend_from_slice(b"qwen3");
-                    v
-                }),
-                ("qwen3.embedding_length", 4, 2560u32.to_le_bytes().to_vec()),
-            ]),
+            gguf_with_tensors(
+                &[("qwen3.pooling_type", 4, 4u32.to_le_bytes().to_vec())],
+                &[("cls.output.weight", vec![1024, 2])],
+            ),
         )
         .unwrap();
-        let meta = read_model_meta(&model);
-        assert_eq!(meta.architecture.as_deref(), Some("qwen3"));
-        assert_eq!(meta.embedding_dim, Some(2560));
-        assert!(!meta.rerank_capable);
         assert_eq!(
-            ModelKind::classify_with_metadata(&model, "plain-embed.gguf"),
+            ModelKind::classify_with_metadata(&model, "qwen-like.gguf"),
+            ModelKind::Rerank
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pooling_type_beats_file_name() {
+        // bge-m3 实测：文件名带 m3、元数据 pooling_type = 2(mean)，应为向量模型。
+        let dir = temp_dir("pooling_wins");
+        let model = dir.join("bge-m3-Q8_0.gguf");
+        fs::write(
+            &model,
+            gguf_with_kvs(&[("bert.pooling_type", 4, 2u32.to_le_bytes().to_vec())]),
+        )
+        .unwrap();
+        assert_eq!(
+            ModelKind::classify_with_metadata(&model, "bge-m3-Q8_0.gguf"),
             ModelKind::Embedding
         );
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn unknown_model_falls_back_to_other() {
-        let dir = temp_dir("classify_other");
-        let model = dir.join("mystery.gguf");
-        fs::write(&model, minimal_gguf(3)).unwrap();
+    fn file_name_is_only_a_fallback() {
+        // 元数据完全没有时，才用文件名关键词。
+        let dir = temp_dir("name_fallback");
+        let rerank = dir.join("bge-reranker-v2-m3.gguf");
+        fs::write(&rerank, minimal_gguf(3)).unwrap();
         assert_eq!(
-            ModelKind::classify_with_metadata(&model, "mystery.gguf"),
+            ModelKind::classify_with_metadata(&rerank, "bge-reranker-v2-m3.gguf"),
+            ModelKind::Rerank
+        );
+        let embed = dir.join("some-embed-model.gguf");
+        fs::write(&embed, minimal_gguf(3)).unwrap();
+        assert_eq!(
+            ModelKind::classify_with_metadata(&embed, "some-embed-model.gguf"),
+            ModelKind::Embedding
+        );
+        let other = dir.join("mystery.gguf");
+        fs::write(&other, minimal_gguf(3)).unwrap();
+        assert_eq!(
+            ModelKind::classify_with_metadata(&other, "mystery.gguf"),
             ModelKind::Other
         );
         fs::remove_dir_all(&dir).unwrap();

@@ -40,9 +40,10 @@ copy target\release\llama-rag-gui.exe .
 
 模型类型在导入与扫描时**自动判定**，不需要手动选择（详见 [模型管理](models.md)）：
 
-- 文件名含 `rerank` / `reranker` / `cross-encoder` / `bge-m3` → 重排模型
-- GGUF 元数据里 `<arch>.pooling_type = 4`（rank）或 `supports_rerank` → 重排模型
-- 文件名含 `embed` / `bge-large|base|small` / `gte-` / `e5-` / `gtr-` / `jina-` / `m3e` / `text2vec` → 向量模型
+- **有分类头张量**（`cls.*` / `classifier.*`）→ 重排模型。这是最可靠的判据，重排模型必有打分头
+- **`<arch>.pooling_type`**：`mean` / `cls` / `last` → 向量模型；`rank` → 重排模型
+- **文件名关键词**（仅在元数据给不出结论时兜底）：含 `rerank` / `cross-encoder` 判为重排，
+  含 `embed` / `bge-m3` / `gte-` / `e5-` / `jina-` 等判为向量
 - 都不命中 → `Other`：仍会列出，但不会出现在两个模型下拉中
 
 ## 下一步

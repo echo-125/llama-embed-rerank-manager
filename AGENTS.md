@@ -69,8 +69,10 @@ exe 所在目录扫描，不要提交进仓库。仓库**不含任何本机固�
 - **模型选择**：模型行的下拉只显示与当前服务同类型的模型（由 `ModelKind::fits_service` 判断），选择会立即
   写入 `config.json`；启动前仍会校验文件存在。导入完成后会自动把模型分配给对应类型。
 - **模型类型自动判定**：`ModelKind::classify_with_metadata` 是唯一入口（扫描与导入共用），模型文件页只读展示。
-  文件名关键词优先（重排关键词 → Rerank），元数据 `pooling_type = 4`(rank) / `supports_rerank` 补充判定。
-  **不要用 `embedding_length` 判向量**：重排模型同样带该字段；也不要用架构名做子串匹配（`qwen3` 含 `m3`）。
+  判定优先级：**分类头张量**（`cls.*` / `classifier.*`，最后一维 ≤ 2）→ Rerank；
+  `<arch>.pooling_type`（2=mean / 3=cls / 4=last → 向量，5=rank → 重排）；文件名关键词仅作兜底。
+  三条禁令：**不要用 `embedding_length` 判向量**（重排模型同样带）；**不要把 `bge-m3` 当重排**（它是
+  向量模型，重排是独立的 `bge-reranker-v2-m3`）；**不要用架构名做子串匹配**（`qwen3` 含 `m3`）。
 - **模型文件页只读**：不提供删除 / 隐藏模型的功能，只有导入与导出；磁盘文件由用户用资源管理器管理。
   不要重新引入「移除导入」这类状态，它会让配置与磁盘状态不一致。
 - **模型目录可配置**：`config.json` 的 `model_dir` 优先，缺失或目录不存在时回退到 `resolve_base_dir`。
