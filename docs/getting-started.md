@@ -38,11 +38,12 @@ copy target\release\llama-rag-gui.exe .
 2. 否则用 exe 所在目录（发布形态：exe 与模型、`config.json` 同级）
 3. 目录里暂时没有模型也没关系，可直接点「模型文件」页的「+ 导入」把模型放进来
 
-模型类型按三级识别（手动修正 > GGUF 元数据 > 文件名），详见 [模型管理](models.md)：
+模型类型在导入与扫描时**自动判定**，不需要手动选择（详见 [模型管理](models.md)）：
 
-- GGUF 元数据里有 `<arch>.embedding_length` → 向量模型
-- 否则看文件名：含 `embed` / `bge-m3` / `gte-` / `e5-` 判为向量，含 `rerank` 判为重排
-- 识别为 `Other` 的模型仍会列出，但不会出现在两个模型下拉中；也可以在模型文件页直接修正类型
+- 文件名含 `rerank` / `reranker` / `cross-encoder` / `bge-m3` → 重排模型
+- GGUF 元数据里 `<arch>.pooling_type = 4`（rank）或 `supports_rerank` → 重排模型
+- 文件名含 `embed` / `bge-large|base|small` / `gte-` / `e5-` / `gtr-` / `jina-` / `m3e` / `text2vec` → 向量模型
+- 都不命中 → `Other`：仍会列出，但不会出现在两个模型下拉中
 
 ## 下一步
 

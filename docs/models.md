@@ -7,35 +7,7 @@
 | 向量 embedding | 9932 | `POST /v1/embeddings` | `Qwen3-Embedding-4B-Q6_K.gguf` | 单位向量（点积 = 余弦相似度） |
 | 重排 rerank | 9933 | `POST /v1/rerank` | `bge-reranker-v2-m3-F16.gguf` | 相关性 logit 分数 |
 
-## 模型类型判断
-
-三级识别，优先级从高到低：
-
-1. **手动修正**：模型文件页的类型下拉（见下文「手动修正类型」）
-2. **GGUF 元数据**：能读到 `<arch>.embedding_length` 判为 Embedding
-3. **文件名启发式**：
-
-| 文件名包含 | 类型 |
-|---|---|
-| `embed` / `bge-m3` / `gte-` / `e5-` | Embedding |
-| `rerank` | Rerank |
-| 其他 | Other |
-
-对话 / VLM / 翻译等生成式模型的 GGUF 会落到 Other，这是有意的范围限制：本项目只管理向量与
-重排，不把它们接入服务行。
-
-只有 Embedding / Rerank 会出现在模型下拉中。Other 模型仍会显示在模型文件页，但不能分配给
-向量或重排服务。Rerank 在 GGUF 元数据里没有可靠标记，依赖文件名规则 + 手动修正兜底。
-
-## 手动修正类型
-
-模型文件页每行的「模型类型」徽章本身是下拉菜单，可选 Embedding / Rerank / Other 即时修正：
-
-- 修正立即写入 `config.json` 的 `model_kinds`，重启后保持
-- 修正影响模型下拉过滤与导入后的自动分配
-- 改回后恢复自动识别的结果
-
-## 模型维度
+## 模型类型判断chr(10)chr(10)类型在**导入与扫描时自动判定**，不需要手动选择。判定规则：chr(10)chr(10)1. **文件名含重排关键词** → Rerank：`rerank` / `reranker` / `cross-encoder` / `bge-m3`chr(10)2. **GGUF 元数据宣告重排能力** → Rerank：`<arch>.pooling_type = 4`（rank）或 `supports_rerank`chr(10)3. **文件名含向量关键词** → Embedding：`embed` / `bge-large|base|small` / `gte-` / `e5-` / `gtr-` / `jina-` / `m3e` / `text2vec`chr(10)4. 都不命中 → `Other`chr(10)chr(10)> **为什么不能只看元数据**：重排模型（`Qwen3-Reranker`、`bge-reranker`、`bge-m3`）同样带chr(10)> `<arch>.embedding_length`，若以此判定向量模型，会把全部模型都判成 Embedding。chr(10)> 因此文件名关键词是第一判据，元数据只用来补「名字里没有 rerank 但确实声明了 rank 池化」的情况。chr(10)chr(10)对话 / VLM / 翻译等生成式模型的 GGUF 会落到 Other，这是有意的范围限制：本项目只管理向量与chr(10)重排，不把它们接入服务行。chr(10)chr(10)只有 Embedding / Rerank 会出现在模型下拉中。Other 模型仍会显示在模型文件页，但不能分配给chr(10)向量或重排服务。chr(10)chr(10)## 类型显示chr(10)chr(10)模型文件页的「模型类型」列是**只读展示**，按颜色区分：chr(10)chr(10)| 类型 | 颜色 | 含义 |chr(10)|---|---|---|chr(10)| Embedding | 蓝色 | 可分配给向量服务（9932） |chr(10)| Rerank | 绿色 | 可分配给重排服务（9933） |chr(10)| Other | 紫色 | 不进入任何服务下拉 |chr(10)chr(10)鼠标悬停会提示「按 GGUF 元数据与文件名自动识别」。如需纠正识别结果，请调整文件名chr(10)（例如在文件名里加上 `rerank`）后重新扫描。chr(10)## 模型维度
 
 - 只对向量模型读取 GGUF 元数据中的 `<arch>.embedding_length`
 - 模型文件页的「维度」列显示读取结果，例如 `2560`

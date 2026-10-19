@@ -54,7 +54,7 @@ copy target\release\llama-rag-gui.exe ..\
 
 - 默认端口、模型名与 llama-server 参数：`src/service.rs` 的 `ServiceType`
 - 接入模型名：`model_alias`、`start_service` 的 `--alias`、启动脚本
-- 模型类型判断：`ModelKind::classify_with_metadata`、`config.model_kinds` 覆盖与模型下拉过滤
+- 模型类型判断：`ModelKind::classify_with_metadata`（文件名关键词 + GGUF 元数据），扫描与导入共用这一入口
 - 新增配置字段：`AppConfig`、README/docs、`config.json` 示例
 - 导入 / 导出复制逻辑：`copy_with_progress`、冲突弹窗（`ImportConflict`）（不涉及外部脚本）
 

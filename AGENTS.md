@@ -46,7 +46,7 @@ exe 所在目录扫描，不要提交进仓库。仓库**不含任何本机固�
 - `src/pdh.rs` — Windows 性能计数器（PDH）封装：枚举 GPU 实例、逐实例读数值
 - `src/model_mgr.rs` — 扫描 / 导入 / 导出 GGUF；元数据 + 文件名判断 Embedding / Rerank / Other
 - `src/config.rs` — `AppConfig`：两个端口、两个模型、`model_dir`、`auto_assign_imported`、
-  `model_kinds`、`llama_exe_path`、`dark_mode`、`language`，读写 `config.json`
+  `llama_exe_path`、`dark_mode`、`language`，读写 `config.json`
 - `src/lang.rs` — `Language::{Zh, En}` 与翻译辅助
 - `src/icon.rs` — 内嵌 llama.app 图标的 RGBA 资源
 - `src/tray.rs` — 系统托盘与中英文菜单
@@ -68,6 +68,9 @@ exe 所在目录扫描，不要提交进仓库。仓库**不含任何本机固�
   `pending_port`，重启/停止后生效。启动/重启前会先应用草稿；两个端口必须互不相同。
 - **模型选择**：模型行的下拉只显示与当前服务同类型的模型（由 `ModelKind::fits_service` 判断），选择会立即
   写入 `config.json`；启动前仍会校验文件存在。导入完成后会自动把模型分配给对应类型。
+- **模型类型自动判定**：`ModelKind::classify_with_metadata` 是唯一入口（扫描与导入共用），模型文件页只读展示。
+  文件名关键词优先（重排关键词 → Rerank），元数据 `pooling_type = 4`(rank) / `supports_rerank` 补充判定。
+  **不要用 `embedding_length` 判向量**：重排模型同样带该字段；也不要用架构名做子串匹配（`qwen3` 含 `m3`）。
 - **模型文件页只读**：不提供删除 / 隐藏模型的功能，只有导入与导出；磁盘文件由用户用资源管理器管理。
   不要重新引入「移除导入」这类状态，它会让配置与磁盘状态不一致。
 - **模型目录可配置**：`config.json` 的 `model_dir` 优先，缺失或目录不存在时回退到 `resolve_base_dir`。

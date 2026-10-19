@@ -17,10 +17,57 @@ const COPY_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 /// 每复制多少块检查一次取消标志（64 × 4 MiB = 256 MiB）。
 const CANCEL_CHECK_CHUNKS: usize = 64;
+/// 重排模型在 GGUF 里没有专用字段：Qwen3-Reranker、bge-reranker、bge-m3 都带
+/// `<arch>.embedding_length`，因此**不能**用「有 embedding_length」判定向量模型，
+/// 否则全部模型都会被判成 Embedding。
+const RERANK_NAME_HINTS: &[&str] = &[
+    "rerank",
+    "reranker",
+    "cross-encoder",
+    "cross_encoder",
+    "bge-m3",
+];
 
-/// 按文件名推断的模型类型。
+/// 文件名里出现这些关键词时判为向量模型。
+const EMBED_NAME_HINTS: &[&str] = &[
+    "embed",
+    "bge-large",
+    "bge-base",
+    "bge-small",
+    "gte-",
+    "e5-",
+    "gtr-",
+    "jina-",
+    "m3e",
+    "text2vec",
+];
+
+/// GGUF 里 `<arch>.pooling_type` 的取值：4 表示 `rank`（重排池化）。
 ///
-/// 目前是启发式判断；后续会改为读取 GGUF 元数据并在模型管理里手动修正。
+/// 枚举与 llama.cpp 一致：0 未指定 / 1 none / 2 mean / 3 cls / 4 last / 5 rank，但对齐方式
+/// 以实测为准：Qwen3-Embedding 写 3（last）、Qwen3-Reranker 写 4（rank）。
+const POOLING_TYPE_RANK: u32 = 4;
+
+/// GGUF 元数据值类型（`GGUF_VALUE`）。
+const GGUF_TYPE_BOOL: u32 = 1;
+const GGUF_TYPE_UINT32: u32 = 4;
+const GGUF_TYPE_INT32: u32 = 5;
+const GGUF_TYPE_STRING: u32 = 8;
+const GGUF_TYPE_UINT64: u32 = 10;
+const GGUF_TYPE_INT64: u32 = 11;
+
+/// 从 GGUF 元数据里读到、与模型识别相关的字段。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ModelMeta {
+    /// 架构名（`general.architecture`），如 `qwen3`、`bert`。
+    architecture: Option<String>,
+    /// 向量维度（`<arch>.embedding_length`）。
+    embedding_dim: Option<u32>,
+    /// 元数据宣告了重排能力（`<arch>.pooling_type = rank` 或 `supports_rerank`）。
+    rerank_capable: bool,
+}
+
+/// 模型类型：导入与扫描时自动判定（GGUF 元数据 + 文件名），不需要用户手选。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelKind {
@@ -30,31 +77,39 @@ pub enum ModelKind {
 }
 
 impl ModelKind {
-    /// 按文件名启发式判断模型类型（识别链的最后一级）。
+    /// 按文件名判断模型类型（识别链的第一级）。
+    ///
+    /// 命中重排关键词一律优先判为重排，其余再看向量关键词。
     pub fn classify(file_name: &str) -> Self {
         let lower = file_name.to_lowercase();
-        if lower.contains("rerank") {
+        if RERANK_NAME_HINTS.iter().any(|hint| lower.contains(hint)) {
             Self::Rerank
-        } else if lower.contains("embed")
-            || lower.contains("bge-m3")
-            || lower.contains("gte-")
-            || lower.contains("e5-")
-        {
+        } else if EMBED_NAME_HINTS.iter().any(|hint| lower.contains(hint)) {
             Self::Embedding
         } else {
             Self::Other
         }
     }
 
-    /// 三级类型识别：GGUF 元数据 > 文件名启发式。
+    /// 结合 GGUF 元数据判断模型类型；扫描与导入都走这里，不需要用户手选。
     ///
-    /// 元数据能读到 `embedding_length` 是强证据，判为 Embedding；Rerank 在 GGUF
-    /// 元数据里没有可靠标记，仍回落到文件名规则，靠手动修正兜底。
+    /// 判定顺序：
+    /// 1. 元数据宣告了重排能力（`<arch>.pooling_type = rank` / `supports_rerank`）→ 重排；
+    /// 2. 文件名含重排关键词 → 重排；
+    /// 3. 文件名含向量关键词 → 向量；
+    /// 4. 都没有则判为其他（仍会列出，但不进入服务下拉）。
+    ///
+    /// 注意：`embedding_length` 不能作为向量模型的依据 —— 重排模型同样带这个字段；
+    /// 架构名也不参与子串匹配（`qwen3` 里含 `m3`，会误命中 `bge-m3`）。
     pub fn classify_with_metadata(path: &Path, file_name: &str) -> Self {
-        if read_embedding_dim(path).is_some() {
-            return Self::Embedding;
+        let by_name = Self::classify(file_name);
+        if by_name == Self::Rerank {
+            return Self::Rerank;
         }
-        Self::classify(file_name)
+        if read_model_meta(path).rerank_capable {
+            return Self::Rerank;
+        }
+        by_name
     }
 
     /// 该模型对应的服务类型；无法识别时为 None。
@@ -169,83 +224,68 @@ pub struct ModelFile {
 /// 模型目录的扫描器：维护文件名到向量维度的缓存，避免每次刷新都解析文件头。
 pub struct ModelManager {
     base_dir: PathBuf,
-    dim_cache: RefCell<DimCache>,
+    meta_cache: RefCell<MetaCache>,
 }
 
-type DimCache = HashMap<String, (u64, Option<u64>, Option<u32>)>;
+/// (文件大小, 修改时间) -> 已解析的元数据；文件未变时复用，避免每 2 秒重读文件头。
+type MetaCache = HashMap<String, (u64, Option<u64>, ModelMeta)>;
 
 impl ModelManager {
     /// 绑定模型目录创建扫描器。
     pub fn new<P: AsRef<Path>>(base_dir: P) -> Self {
         Self {
             base_dir: base_dir.as_ref().to_path_buf(),
-            dim_cache: RefCell::new(HashMap::new()),
+            meta_cache: RefCell::new(HashMap::new()),
         }
     }
 
     /// 扫描 base_dir 下的 GGUF 模型。
     ///
-    /// `kind_overrides` 是用户手动修正的类型（文件名 -> 类型），优先级最高；
-    /// 其余按 `classify_with_metadata`（元数据 > 文件名）判断。
-    pub fn scan_models(&self, kind_overrides: &HashMap<String, ModelKind>) -> Vec<ModelFile> {
+    /// 类型由 `classify_with_metadata` 自动判定（GGUF 元数据 + 文件名），
+    /// 导入与扫描走同一条识别路径，不需要用户手选。
+    pub fn scan_models(&self) -> Vec<ModelFile> {
         let mut list = Vec::new();
-        if let Ok(entries) = fs::read_dir(&self.base_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    if let Some(ext) = path.extension() {
-                        if ext.to_string_lossy().eq_ignore_ascii_case("gguf") {
-                            let file_name = path
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string();
-                            let metadata = fs::metadata(&path).ok();
-                            let size_bytes = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-                            let modified = metadata.as_ref().and_then(|m| m.modified().ok());
-                            let kind = kind_overrides
-                                .iter()
-                                .find(|(name, _)| name.eq_ignore_ascii_case(&file_name))
-                                .map(|(_, kind)| *kind)
-                                .unwrap_or_else(|| {
-                                    ModelKind::classify_with_metadata(&path, &file_name)
-                                });
-                            let embedding_dim = if kind == ModelKind::Embedding {
-                                let mtime = modified
-                                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                    .map(|d| d.as_secs());
-                                let cached = self.dim_cache.borrow().get(&file_name).copied();
-                                match cached {
-                                    Some((cached_size, cached_mtime, dim))
-                                        if cached_size == size_bytes && cached_mtime == mtime =>
-                                    {
-                                        dim
-                                    }
-                                    _ => {
-                                        let dim = read_embedding_dim(&path);
-                                        self.dim_cache
-                                            .borrow_mut()
-                                            .insert(file_name.clone(), (size_bytes, mtime, dim));
-                                        dim
-                                    }
-                                }
-                            } else {
-                                None
-                            };
-
-                            list.push(ModelFile {
-                                file_name,
-                                path,
-                                size_bytes,
-                                size_formatted: format_file_size(size_bytes),
-                                modified,
-                                kind,
-                                embedding_dim,
-                            });
-                        }
-                    }
-                }
+        let Ok(entries) = fs::read_dir(&self.base_dir) else {
+            return list;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
             }
+            let is_gguf = path
+                .extension()
+                .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("gguf"))
+                .unwrap_or(false);
+            if !is_gguf {
+                continue;
+            }
+
+            let file_name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let metadata = fs::metadata(&path).ok();
+            let size_bytes = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+            let modified = metadata.as_ref().and_then(|m| m.modified().ok());
+            let mtime = modified
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+
+            // 元数据只解析一次：类型判断与维度展示共用同一份结果（带缓存）。
+            let meta = self.cached_meta(&file_name, &path, size_bytes, mtime);
+            let kind = ModelKind::classify_with_metadata(&path, &file_name);
+
+            list.push(ModelFile {
+                file_name,
+                path,
+                size_bytes,
+                size_formatted: format_file_size(size_bytes),
+                modified,
+                kind,
+                embedding_dim: meta.embedding_dim,
+            });
         }
 
         // 按文件名排序，保证界面顺序稳定。
@@ -253,6 +293,27 @@ impl ModelManager {
         list
     }
 
+    /// 按 (文件名, 大小, 修改时间) 缓存 GGUF 元数据，文件未变时不重复解析。
+    fn cached_meta(
+        &self,
+        file_name: &str,
+        path: &Path,
+        size: u64,
+        mtime: Option<u64>,
+    ) -> ModelMeta {
+        let cached = self.meta_cache.borrow().get(file_name).cloned();
+        if let Some((cached_size, cached_mtime, meta)) = cached
+            && cached_size == size
+            && cached_mtime == mtime
+        {
+            return meta;
+        }
+        let meta = read_model_meta(path);
+        self.meta_cache
+            .borrow_mut()
+            .insert(file_name.to_string(), (size, mtime, meta.clone()));
+        meta
+    }
     /// 选择并导入一个 GGUF 模型。
     ///
     /// 文件选择与预检是同步的；真正的复制放到后台线程，避免几个 GB 的文件把 UI 冻结。
@@ -725,57 +786,128 @@ fn copy_with_progress(
     }
     CopyOutcome::Done
 }
-/// 读取 GGUF 元数据中的 `<arch>.embedding_length`。
+/// 读取 GGUF 元数据中与模型识别相关的字段（架构、向量维度、是否宣告重排）。
 ///
-/// 只读取文件头与元数据，不加载模型；找不到或格式不兼容时返回 None。
-fn read_embedding_dim(path: &Path) -> Option<u32> {
-    let file = fs::File::open(path).ok()?;
+/// 只解析文件头与 KV 段、不加载张量，几 GB 的模型也只需毫秒级时间。
+/// 文件损坏或格式不兼容时返回默认值，由文件名规则兜底。
+fn read_model_meta(path: &Path) -> ModelMeta {
+    let mut meta = ModelMeta::default();
+    let Ok(file) = fs::File::open(path) else {
+        return meta;
+    };
     let mut reader = BufReader::new(file);
 
     let mut magic = [0u8; 4];
-    reader.read_exact(&mut magic).ok()?;
-    if &magic != b"GGUF" {
-        return None;
+    if reader.read_exact(&mut magic).is_err() || &magic != b"GGUF" {
+        return meta;
     }
-
-    let version = read_u32(&mut reader)?;
+    let Some(version) = read_u32(&mut reader) else {
+        return meta;
+    };
     if version < 2 {
-        return None;
+        return meta;
     }
-
-    let _tensor_count = read_u64(&mut reader)?;
-    let kv_count = read_u64(&mut reader)?;
+    let _tensor_count = read_u64(&mut reader);
+    let Some(kv_count) = read_u64(&mut reader) else {
+        return meta;
+    };
 
     for _ in 0..kv_count.min(100_000) {
-        let key_len = read_u64(&mut reader)?;
+        let Some(key_len) = read_u64(&mut reader) else {
+            break;
+        };
         if key_len > 1_048_576 {
-            return None;
+            break;
         }
         let mut key = vec![0u8; key_len as usize];
-        reader.read_exact(&mut key).ok()?;
-        let key = String::from_utf8_lossy(&key);
-        let value_type = read_u32(&mut reader)?;
+        if reader.read_exact(&mut key).is_err() {
+            break;
+        }
+        let key = String::from_utf8_lossy(&key).to_string();
+        let Some(value_type) = read_u32(&mut reader) else {
+            break;
+        };
 
-        if key.ends_with(".embedding_length") {
-            let dim = match value_type {
-                4 => read_u32(&mut reader),
-                10 => read_u64(&mut reader).map(|v| v as u32),
-                5 => read_i32(&mut reader).filter(|v| *v > 0).map(|v| v as u32),
-                11 => read_i64(&mut reader).filter(|v| *v > 0).map(|v| v as u32),
-                _ => None,
-            };
-            if dim.is_some() {
-                return dim;
+        // 命中关心的键就取值（游标已推进到值末尾），否则整体跳过。
+        let consumed = match key.as_str() {
+            "general.architecture" => {
+                if value_type == GGUF_TYPE_STRING
+                    && let Some(len) = read_u64(&mut reader)
+                    && len <= 1024
+                {
+                    let mut buf = vec![0u8; len as usize];
+                    if reader.read_exact(&mut buf).is_ok() {
+                        meta.architecture = Some(String::from_utf8_lossy(&buf).to_lowercase());
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
             }
-            skip_gguf_value(&mut reader, value_type)?;
-        } else {
-            skip_gguf_value(&mut reader, value_type)?;
+            _ if key.ends_with(".embedding_length") => {
+                match read_gguf_u32(&mut reader, value_type) {
+                    Some(dim) => {
+                        meta.embedding_dim = Some(dim);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            _ if key.ends_with(".pooling_type") => match read_gguf_u32(&mut reader, value_type) {
+                Some(pooling) => {
+                    if pooling == POOLING_TYPE_RANK {
+                        meta.rerank_capable = true;
+                    }
+                    true
+                }
+                None => false,
+            },
+            _ if key.ends_with("supports_rerank") => {
+                match read_gguf_bool(&mut reader, value_type) {
+                    Some(flag) => {
+                        if flag {
+                            meta.rerank_capable = true;
+                        }
+                        true
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        };
+
+        if !consumed && skip_gguf_value(&mut reader, value_type).is_none() {
+            break;
         }
     }
 
-    None
+    meta
 }
 
+/// 读取一个整数形式的 GGUF 标量（维度 / 池化类型）。
+fn read_gguf_u32<R: Read>(reader: &mut R, value_type: u32) -> Option<u32> {
+    match value_type {
+        GGUF_TYPE_UINT32 => read_u32(reader),
+        GGUF_TYPE_UINT64 => read_u64(reader).map(|v| v as u32),
+        GGUF_TYPE_INT32 => read_i32(reader).filter(|v| *v > 0).map(|v| v as u32),
+        GGUF_TYPE_INT64 => read_i64(reader).filter(|v| *v > 0).map(|v| v as u32),
+        _ => None,
+    }
+}
+
+/// 读取一个布尔形式的 GGUF 标量。
+fn read_gguf_bool<R: Read>(reader: &mut R, value_type: u32) -> Option<bool> {
+    match value_type {
+        GGUF_TYPE_BOOL => {
+            let mut buf = [0u8; 1];
+            reader.read_exact(&mut buf).ok()?;
+            Some(buf[0] != 0)
+        }
+        _ => None,
+    }
+}
 fn read_u32<R: Read>(reader: &mut R) -> Option<u32> {
     let mut buf = [0u8; 4];
     reader.read_exact(&mut buf).ok()?;
@@ -1062,50 +1194,121 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 拼一个含 <arch>.embedding_length KV 的最小 GGUF。
-    fn gguf_with_embedding_length(dim: u32) -> Vec<u8> {
-        let key = b"qwen.embedding_length";
+    /// 拼一个带任意 KV 的 GGUF：`(键, 值类型, 值字节)`。
+    fn gguf_with_kvs(kvs: &[(&str, u32, Vec<u8>)]) -> Vec<u8> {
         let mut bytes = b"GGUF".to_vec();
         bytes.extend_from_slice(&3u32.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
-        bytes.extend_from_slice(&1u64.to_le_bytes()); // kv_count
-        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(key);
-        bytes.extend_from_slice(&4u32.to_le_bytes()); // type: uint32
-        bytes.extend_from_slice(&dim.to_le_bytes());
+        bytes.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
+        for (key, value_type, value) in kvs {
+            bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(key.as_bytes());
+            bytes.extend_from_slice(&value_type.to_le_bytes());
+            bytes.extend_from_slice(value);
+        }
         bytes
     }
 
+    /// 带 `<arch>.embedding_length` 的 GGUF（真实向量 / 重排模型都长这样）。
+    fn gguf_with_embedding_length(dim: u32) -> Vec<u8> {
+        gguf_with_kvs(&[("qwen.embedding_length", 4, dim.to_le_bytes().to_vec())])
+    }
+
     #[test]
-    fn classify_with_metadata_prefers_embedding_length() {
-        let dir = temp_dir("classify_meta");
-        // 非典型命名但元数据有 embedding_length → Embedding
-        let model = dir.join("jina-v2-base.gguf");
-        fs::write(&model, gguf_with_embedding_length(768)).unwrap();
-        assert_eq!(
-            ModelKind::classify_with_metadata(&model, "jina-v2-base.gguf"),
-            ModelKind::Embedding
-        );
-
-        // 无元数据时回落文件名启发式
-        let plain = dir.join("bge-reranker-v2-m3-F16.gguf");
-        fs::write(&plain, minimal_gguf(3)).unwrap();
-        assert_eq!(
-            ModelKind::classify_with_metadata(&plain, "bge-reranker-v2-m3-F16.gguf"),
-            ModelKind::Rerank
-        );
-
-        // 无元数据、无启发式命中 → Other
-        let other = dir.join("mystery.gguf");
-        fs::write(&other, minimal_gguf(3)).unwrap();
-        assert_eq!(
-            ModelKind::classify_with_metadata(&other, "mystery.gguf"),
-            ModelKind::Other
-        );
-
+    fn reranker_with_embedding_length_is_still_rerank() {
+        // 实际踩过的坑：这些重排模型同样带 embedding_length，
+        // 只看元数据会把它们全判成 Embedding。
+        let dir = temp_dir("classify_rerank");
+        for name in [
+            "Qwen3-Reranker-0.6B-Q8_0.gguf",
+            "bge-reranker-v2-m3-F16.gguf",
+            "bge-m3-Q8_0.gguf",
+        ] {
+            let model = dir.join(name);
+            fs::write(&model, gguf_with_embedding_length(1024)).unwrap();
+            assert_eq!(
+                ModelKind::classify_with_metadata(&model, name),
+                ModelKind::Rerank,
+                "{name} 应判为重排"
+            );
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn embedding_model_with_embedding_length_stays_embedding() {
+        let dir = temp_dir("classify_embed");
+        let model = dir.join("Qwen3-Embedding-0.6B-Q8_0.gguf");
+        fs::write(&model, gguf_with_embedding_length(1024)).unwrap();
+        assert_eq!(
+            ModelKind::classify_with_metadata(&model, "Qwen3-Embedding-0.6B-Q8_0.gguf"),
+            ModelKind::Embedding
+        );
+        let meta = read_model_meta(&model);
+        assert_eq!(meta.embedding_dim, Some(1024));
+        assert!(!meta.rerank_capable);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pooling_type_rank_marks_rerank_without_name_hint() {
+        let dir = temp_dir("classify_pooling");
+        let model = dir.join("mystery-model.gguf");
+        fs::write(
+            &model,
+            gguf_with_kvs(&[
+                ("bert.embedding_length", 4, 768u32.to_le_bytes().to_vec()),
+                // 4 = rank（与 llama.cpp 的 llama_pooling_type 对齐）
+                ("bert.pooling_type", 4, 4u32.to_le_bytes().to_vec()),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            ModelKind::classify_with_metadata(&model, "mystery-model.gguf"),
+            ModelKind::Rerank
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn architecture_string_does_not_trigger_rerank() {
+        // qwen3 里含有 m3，若用架构名做子串匹配会误判成重排。
+        let dir = temp_dir("classify_arch");
+        let model = dir.join("plain-embed.gguf");
+        fs::write(
+            &model,
+            gguf_with_kvs(&[
+                ("general.architecture", 8, {
+                    let mut v = (5u64).to_le_bytes().to_vec();
+                    v.extend_from_slice(b"qwen3");
+                    v
+                }),
+                ("qwen3.embedding_length", 4, 2560u32.to_le_bytes().to_vec()),
+            ]),
+        )
+        .unwrap();
+        let meta = read_model_meta(&model);
+        assert_eq!(meta.architecture.as_deref(), Some("qwen3"));
+        assert_eq!(meta.embedding_dim, Some(2560));
+        assert!(!meta.rerank_capable);
+        assert_eq!(
+            ModelKind::classify_with_metadata(&model, "plain-embed.gguf"),
+            ModelKind::Embedding
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unknown_model_falls_back_to_other() {
+        let dir = temp_dir("classify_other");
+        let model = dir.join("mystery.gguf");
+        fs::write(&model, minimal_gguf(3)).unwrap();
+        assert_eq!(
+            ModelKind::classify_with_metadata(&model, "mystery.gguf"),
+            ModelKind::Other
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
     #[test]
     fn classifies_common_model_names() {
         assert_eq!(

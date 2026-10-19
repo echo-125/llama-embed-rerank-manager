@@ -188,7 +188,7 @@ impl RagGuiApp {
         ));
 
         let model_mgr = ModelManager::new(&base_dir);
-        let models = model_mgr.scan_models(&config.model_kinds);
+        let models = model_mgr.scan_models();
 
         let llama_exe = config
             .llama_exe_path
@@ -270,7 +270,7 @@ impl RagGuiApp {
 
     /// 重新扫描模型目录并刷新列表（导入 / 导出 / 切换目录后调用）。
     fn refresh_models(&mut self) {
-        self.models = self.model_mgr.scan_models(&self.config.model_kinds.clone());
+        self.models = self.model_mgr.scan_models();
     }
 
     /// 导入完成后的收尾：刷新列表、按策略自动分配对应服务并落盘。
@@ -1269,8 +1269,6 @@ impl RagGuiApp {
         let mut do_open_dir = false;
         let mut to_export = None;
         let mut do_cancel_copy = false;
-        let mut kind_selection: Option<ModelKind> = None;
-        let mut kind_changed: Option<String> = None;
 
         card_frame(self.config.dark_mode).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -1369,10 +1367,7 @@ impl RagGuiApp {
                 .filter(|m| query.is_empty() || m.file_name.to_lowercase().contains(&query))
                 .collect();
 
-            let render_table = |ui: &mut egui::Ui,
-                                to_export: &mut Option<String>,
-                                kind_selection: &mut Option<ModelKind>,
-                                kind_changed: &mut Option<String>| {
+            let render_table = |ui: &mut egui::Ui, to_export: &mut Option<String>| {
                 const COL_TYPE: f32 = 90.0;
                 const COL_SIZE: f32 = 80.0;
                 const COL_DIM: f32 = 80.0;
@@ -1429,33 +1424,12 @@ impl RagGuiApp {
                         });
 
                         table_cell(ui, COL_TYPE, |ui| {
-                            // 类型徽章即下拉菜单：手动修正类型（元数据 / 文件名识别的兜底）。
-                            egui::ComboBox::from_id_salt(format!("kind_{}", model.file_name))
-                                .selected_text(
-                                    RichText::new(type_name).size(10.5).strong().color(fg_color),
-                                )
-                                .width(COL_TYPE - 14.0)
-                                .show_ui(ui, |ui| {
-                                    for kind in
-                                        [ModelKind::Embedding, ModelKind::Rerank, ModelKind::Other]
-                                    {
-                                        let label = match kind {
-                                            ModelKind::Embedding => "Embedding",
-                                            ModelKind::Rerank => "Rerank",
-                                            ModelKind::Other => lang.t("其他", "Other"),
-                                        };
-                                        if ui
-                                            .selectable_value(
-                                                &mut *kind_selection,
-                                                Some(kind),
-                                                label,
-                                            )
-                                            .changed()
-                                        {
-                                            *kind_changed = Some(model.file_name.clone());
-                                        }
-                                    }
-                                });
+                            // 类型由导入 / 扫描时自动判定（GGUF 元数据 + 文件名），这里只读展示。
+                            ui.label(RichText::new(type_name).size(11.0).strong().color(fg_color))
+                                .on_hover_text(lang.t(
+                                    "按 GGUF 元数据与文件名自动识别",
+                                    "Detected automatically from GGUF metadata and file name",
+                                ));
                         });
 
                         table_cell(ui, COL_SIZE, |ui| {
@@ -1532,13 +1506,13 @@ impl RagGuiApp {
                 });
                 ui.add_space(12.0);
             } else if filtered_models.len() <= 6 {
-                render_table(ui, &mut to_export, &mut kind_selection, &mut kind_changed);
+                render_table(ui, &mut to_export);
             } else {
                 egui::ScrollArea::vertical()
                     .max_height(160.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        render_table(ui, &mut to_export, &mut kind_selection, &mut kind_changed);
+                        render_table(ui, &mut to_export);
                     });
             }
         });
@@ -1606,20 +1580,6 @@ impl RagGuiApp {
                     );
                 }
             }
-        }
-        if let (Some(file_name), Some(kind)) = (&kind_changed, kind_selection) {
-            // 手动修正类型：写入 model_kinds 覆盖，持久化并刷新下拉过滤。
-            self.config.model_kinds.insert(file_name.clone(), kind);
-            self.save_config();
-            self.refresh_models();
-            self.set_status(
-                if lang.is_zh() {
-                    format!("已将 {} 的类型修正为 {}", file_name, kind.label(lang))
-                } else {
-                    format!("{} kind set to {}", file_name, kind.label(lang))
-                },
-                false,
-            );
         }
     }
 

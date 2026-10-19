@@ -20,9 +20,6 @@ pub struct AppConfig {
     /// 导入完成后是否按模型类型自动分配给对应服务（默认开启）。
     #[serde(default = "default_true")]
     pub auto_assign_imported: bool,
-    /// 用户手动修正的模型类型（文件名 -> 类型），优先于自动识别。
-    #[serde(default)]
-    pub model_kinds: std::collections::HashMap<String, crate::model_mgr::ModelKind>,
     /// 自定义模型目录；`None` 表示使用 exe 所在目录。
     #[serde(default)]
     pub model_dir: Option<String>,
@@ -42,7 +39,6 @@ impl Default for AppConfig {
             embedding_model: None,
             rerank_model: None,
             auto_assign_imported: true,
-            model_kinds: std::collections::HashMap::new(),
             model_dir: None,
             llama_exe_path: None,
             dark_mode: false,
@@ -148,7 +144,6 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_mgr::ModelKind;
 
     #[test]
     fn config_round_trip_and_defaults() {
@@ -186,19 +181,6 @@ mod tests {
         assert!(!partial.dark_mode);
         assert_eq!(partial.language, Language::Zh);
         assert!(partial.auto_assign_imported);
-        assert!(partial.model_kinds.is_empty());
-
-        // model_kinds 读写往返
-        let mut config = AppConfig::default();
-        config
-            .model_kinds
-            .insert("weird.gguf".to_string(), ModelKind::Rerank);
-        config.save(&dir).unwrap();
-        let loaded = AppConfig::load(&dir);
-        assert_eq!(
-            loaded.model_kinds.get("weird.gguf"),
-            Some(&ModelKind::Rerank)
-        );
 
         let mut config = AppConfig::default();
         config.set_port(ServiceType::Rerank, 10035);
