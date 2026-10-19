@@ -43,8 +43,12 @@ const EMBED_NAME_HINTS: &[&str] = &[
 
 /// GGUF 里 `<arch>.pooling_type` 的取值：4 表示 `rank`（重排池化）。
 ///
-/// 枚举与 llama.cpp 一致：0 未指定 / 1 none / 2 mean / 3 cls / 4 last / 5 rank，但对齐方式
-/// 以实测为准：Qwen3-Embedding 写 3（last）、Qwen3-Reranker 写 4（rank）。
+/// 枚举值与 llama.cpp 内部的 `llama_pooling_type` 一致（已用本机 llama.cpp 实测校准）：
+/// 0 unspecified / 1 none / 2 cls / 3 last / 4 rank。
+/// 校准方法：对 GGUF 声明 3 的 Qwen3-Embedding 传 `--pooling cls`，llama 报
+/// "model default pooling_type is [3], but [2] was specified"；传 `--pooling last` 则无警告，
+/// 因此 2 = cls、3 = last；对 bge-m3 传 `--pooling rank` 报 "default [2], but [4] was specified"，
+/// 因此 4 = rank。
 const POOLING_TYPE_RANK: u32 = 4;
 
 /// GGUF 元数据值类型（`GGUF_VALUE`）。
@@ -821,19 +825,26 @@ fn read_model_meta(path: &Path) -> ModelMeta {
         return meta;
     };
 
+    // 只有完整读完 KV 段，游标才正好停在张量信息表起点；中途 break 时不能继续按
+    // 张量表解析，否则会读到垃圾数据（可能误判出分类头）。
+    let mut kv_complete = kv_count <= 100_000;
     for _ in 0..kv_count.min(100_000) {
         let Some(key_len) = read_u64(&mut reader) else {
+            kv_complete = false;
             break;
         };
         if key_len > 1_048_576 {
+            kv_complete = false;
             break;
         }
         let mut key = vec![0u8; key_len as usize];
         if reader.read_exact(&mut key).is_err() {
+            kv_complete = false;
             break;
         }
         let key = String::from_utf8_lossy(&key).to_string();
         let Some(value_type) = read_u32(&mut reader) else {
+            kv_complete = false;
             break;
         };
 
@@ -889,6 +900,7 @@ fn read_model_meta(path: &Path) -> ModelMeta {
         };
 
         if !consumed && skip_gguf_value(&mut reader, value_type).is_none() {
+            kv_complete = false;
             break;
         }
     }
@@ -896,7 +908,8 @@ fn read_model_meta(path: &Path) -> ModelMeta {
     // KV 段之后是张量信息表：这里只看张量名，用来识别重排分类头。
     // 重排模型（bge-reranker、Qwen3-Reranker 等）都在主干之外多一个分类头，
     // 这是它们与同样架构的向量模型在结构上的唯一确定差异。
-    if let Some(tensor_count) = tensor_count
+    if kv_complete
+        && let Some(tensor_count) = tensor_count
         && count_classifier_heads(&mut reader, tensor_count)
     {
         meta.classifier_head = true;
@@ -1379,6 +1392,29 @@ mod tests {
         fs::write(&other, minimal_gguf(3)).unwrap();
         assert_eq!(
             ModelKind::classify_with_metadata(&other, "mystery.gguf"),
+            ModelKind::Other
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn truncated_gguf_does_not_fake_classifier_head() {
+        // KV 段不完整时，游标不在张量表起点，不能继续按张量表解析，
+        // 否则可能从垃圾数据里"读出" cls.* 而误判成重排。
+        let dir = temp_dir("truncated_kv");
+        let model = dir.join("broken.gguf");
+        let mut bytes =
+            gguf_with_kvs(&[("bert.embedding_length", 4, 1024u32.to_le_bytes().to_vec())]);
+        // 声明 5 个 KV 但只写了 1 个，模拟截断文件。
+        let kv_count_at = 8 + 8;
+        bytes[kv_count_at..kv_count_at + 8].copy_from_slice(&5u64.to_le_bytes());
+        // 再塞一段看起来像张量表的数据，确认不会被采信。
+        bytes.extend_from_slice(&4u64.to_le_bytes());
+        bytes.extend_from_slice(b"cls.");
+        fs::write(&model, &bytes).unwrap();
+        let meta = read_model_meta(&model);
+        assert!(!meta.classifier_head, "截断文件不应判出分类头");
+        assert_eq!(
+            ModelKind::classify_with_metadata(&model, "broken.gguf"),
             ModelKind::Other
         );
         fs::remove_dir_all(&dir).unwrap();
