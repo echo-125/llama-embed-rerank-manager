@@ -58,7 +58,8 @@ impl ServiceType {
 
     /// llama-server 的推理参数。
     ///
-    /// 必须与 `start-rag-servers.ps1` 中 `$services` 的 `Args` 保持一致：
+    /// 推理参数集中在此处定义，修改时要同步 `start_service` 的启动逻辑与文档。要点：
+    ///
     /// - 向量服务用 `last` pooling（Qwen3-Embedding 官方做法），
     ///   与 `mean` 产出的向量不在同一空间，混用会让检索结果失真；
     /// - `-b`/`-ub` 统一为 512：embedding 模式下 llama-server 会把
@@ -263,8 +264,10 @@ impl ServiceManager {
     /// 只刷新目标 PID，不为单次查询全量遍历进程表；名称含 "llama" 的判断用于
     /// 防止 PID 被复用后把别的程序误判成仍在运行的服务。
     fn llama_process_alive(&mut self, pid: u32) -> bool {
-        self.sys
-            .refresh_processes(sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
+        self.sys.refresh_processes(
+            sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+            true,
+        );
         self.sys
             .process(Pid::from_u32(pid))
             .map(|proc| {
@@ -451,7 +454,9 @@ impl ServiceManager {
             let err = if self.lang.is_zh() {
                 format!("端口 {port} 已被占用，请更换端口或停止占用该端口的程序")
             } else {
-                format!("Port {port} is already in use. Pick another port or stop the program using it.")
+                format!(
+                    "Port {port} is already in use. Pick another port or stop the program using it."
+                )
             };
             self.services[idx].status = ServiceStatus::Failed(err.clone());
             return Err(err);
@@ -522,7 +527,7 @@ impl ServiceManager {
             },
         );
 
-        // 完整命令行入日志：既可复现启动，也便于与 start-rag-servers.ps1 的参数比对。
+        // 完整命令行入日志：既可复现启动，也便于核对推理参数。
         self.append_log(
             svc_type.name(),
             LogLevel::Info,
@@ -640,7 +645,7 @@ impl ServiceManager {
 
     /// 只停止由本程序亲自拉起的服务（持有子进程句柄的那些）。
     ///
-    /// 退出程序时使用：通过 PID 文件发现的、由 `start-rag-servers.ps1` 启动的实例
+    /// 退出程序时使用：通过 PID 文件发现的、上一轮 GUI 或外部启动的实例
     /// 不属于本程序管理，不应被一并杀掉。
     pub fn stop_owned_services(&mut self) {
         for i in 0..self.services.len() {
@@ -750,7 +755,12 @@ fn spawn_log_pump<R: std::io::Read + Send + 'static>(
                 Ok(text) => text,
                 // 非 UTF-8 输出（如二进制进度信息）不静默丢弃，记录一条占位说明。
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                    push_log(&logs, service, LogLevel::Warn, "<non-utf8 output>".to_string());
+                    push_log(
+                        &logs,
+                        service,
+                        LogLevel::Warn,
+                        "<non-utf8 output>".to_string(),
+                    );
                     continue;
                 }
                 // 其它读取错误（管道断裂等）结束本路日志。
@@ -842,12 +852,12 @@ mod tests {
             classify_log_level("main: warning: deprecated"),
             LogLevel::Warn
         );
+        assert_eq!(classify_log_level("Error: failed to load"), LogLevel::Error);
+        // 大小写不敏感；"warning" 以 "warn" 命中
         assert_eq!(
-            classify_log_level("Error: failed to load"),
+            classify_log_level("failed with ERROR code"),
             LogLevel::Error
         );
-        // 大小写不敏感；"warning" 以 "warn" 命中
-        assert_eq!(classify_log_level("failed with ERROR code"), LogLevel::Error);
     }
 
     #[test]

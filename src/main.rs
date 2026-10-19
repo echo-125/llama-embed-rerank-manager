@@ -18,7 +18,10 @@ use std::time::{Duration, Instant};
 use config::AppConfig;
 use eframe::egui::{self, Color32, CornerRadius, RichText};
 use lang::Language;
-use model_mgr::{ImportJob, ModelFile, ModelKind, ModelManager, format_file_size};
+use model_mgr::{
+    CopyDirection, CopyJob, CopyOutcome, ImportConflict, ModelFile, ModelKind, ModelManager,
+    cleanup_part_files, format_file_size,
+};
 use monitor::Monitor;
 use service::{LogLevel, ServiceManager, ServiceStatus, ServiceType, find_llama_exe, model_alias};
 use theme::{CONTROL_HEIGHT, apply_theme, card_frame, palette};
@@ -26,6 +29,13 @@ use tray::{SystemTray, TrayAction, check_tray_events};
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const HF_GGUF_URL: &str = "https://huggingface.co/models?library=gguf";
+
+/// 自动分配确认弹窗的数据：新导入的模型将替换对应服务当前的选择。
+#[derive(Clone)]
+struct AssignConfirm {
+    file_name: String,
+    svc_type: ServiceType,
+}
 
 /// 顶部 Tab 页签：(中文标签, 中文提示, 英文标签, 英文提示)。
 const TABS: [(&str, &str, &str, &str); 4] = [
@@ -72,8 +82,18 @@ struct RagGuiApp {
     status_message: Option<(String, Instant, bool)>, // (msg, time, is_error)
     delete_confirm_file: Option<String>,
     api_modal_svc: Option<ServiceType>,
-    /// 正在后台复制中的模型导入任务。
-    import_job: Option<ImportJob>,
+    /// 正在后台复制中的模型导入 / 导出任务（同一时间只允许一个）。
+    import_job: Option<CopyJob>,
+    /// 待确认的导入同名冲突（覆盖 / 另存为 / 取消）。
+    import_conflict: Option<ImportConflict>,
+    /// 「另存为」输入的新文件名。
+    conflict_save_as: String,
+    /// 自动分配确认：新导入的模型将替换服务当前选择，等待用户确认。
+    assign_confirm: Option<AssignConfirm>,
+    /// 复制线程仍在运行但已请求取消：等待线程收尾再清任务。
+    cancel_requested: bool,
+    /// 模型文件页是否展开「已移除」列表（逐个恢复）。
+    show_removed: bool,
 
     // Log filters & state
     show_info: bool,
@@ -131,6 +151,8 @@ impl RagGuiApp {
         configure_fonts(&cc.egui_ctx);
 
         let base_dir = resolve_base_dir();
+        // 启动时清理上次复制被中断留下的 `*.gguf.part` 残留（此时不可能有进行中的任务）。
+        let cleaned_parts = cleanup_part_files(&base_dir);
         let config = AppConfig::load(&base_dir);
         apply_theme(&cc.egui_ctx, config.dark_mode);
         cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Title(
@@ -138,7 +160,7 @@ impl RagGuiApp {
         ));
 
         let model_mgr = ModelManager::new(&base_dir);
-        let models = model_mgr.scan_models();
+        let models = model_mgr.scan_models(&config.model_kinds);
 
         let llama_exe = config
             .llama_exe_path
@@ -163,6 +185,17 @@ impl RagGuiApp {
         }
 
         let monitor = Monitor::new();
+        if cleaned_parts > 0 {
+            service_mgr.append_log(
+                "系统",
+                LogLevel::Info,
+                if config.language.is_zh() {
+                    format!("启动时清理了 {cleaned_parts} 个残留的 .part 临时文件")
+                } else {
+                    format!("Cleaned {cleaned_parts} leftover .part temp file(s) at startup")
+                },
+            );
+        }
         let tray = SystemTray::new(config.language).ok();
         let edit_ports = service_mgr
             .services
@@ -185,6 +218,11 @@ impl RagGuiApp {
             delete_confirm_file: None,
             api_modal_svc: None,
             import_job: None,
+            import_conflict: None,
+            conflict_save_as: String::new(),
+            assign_confirm: None,
+            cancel_requested: false,
+            show_removed: false,
             show_info: true,
             show_warn: true,
             show_error: true,
@@ -208,7 +246,7 @@ impl RagGuiApp {
         let ignored = self.config.ignored_models.clone();
         self.models = self
             .model_mgr
-            .scan_models()
+            .scan_models(&self.config.model_kinds.clone())
             .into_iter()
             .filter(|model| {
                 !ignored
@@ -218,14 +256,127 @@ impl RagGuiApp {
             .collect();
     }
 
-    /// 导入完成后，按模型类型自动分配给对应的服务。
-    fn auto_assign_imported_model(&mut self, file_name: &str) -> Option<&'static str> {
+    /// 导入完成后的收尾：清理 ignored 记录、刷新列表、按策略自动分配并落盘。
+    ///
+    /// 若目标服务已有不同的模型且总开关开启，则转入确认弹窗而不是静默覆盖。
+    fn finish_import(&mut self, file_name: &str) {
+        let lang = self.lang();
+        // P0-1：重新导入曾「移除」的同名模型时，把该名字从 ignored_models 里清掉，
+        // 否则新导入的文件会被 refresh_models 继续隐藏。
+        let was_ignored = self
+            .config
+            .ignored_models
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(file_name));
+        if was_ignored {
+            self.config
+                .ignored_models
+                .retain(|n| !n.eq_ignore_ascii_case(file_name));
+        }
+        self.refresh_models();
+
+        if !self.config.auto_assign_imported {
+            // 总开关关闭：只导入不分配。
+            if was_ignored {
+                self.save_config();
+            }
+            self.set_status(
+                if lang.is_zh() {
+                    format!("成功导入 {file_name}")
+                } else {
+                    format!("Imported {file_name}")
+                },
+                false,
+            );
+            return;
+        }
+
+        match self.pending_assign_target(file_name) {
+            // 目标服务当前没有选择模型：静默分配。
+            Some((svc_type, false)) => {
+                let label = self.apply_auto_assign(file_name, svc_type);
+                self.save_config();
+                self.set_status(
+                    if lang.is_zh() {
+                        format!("成功导入 {file_name}，已匹配到「{label}」")
+                    } else {
+                        format!("Imported {file_name}; matched to {label}")
+                    },
+                    false,
+                );
+            }
+            // 目标服务已有不同的模型：转入确认弹窗。
+            Some((svc_type, true)) => {
+                self.assign_confirm = Some(AssignConfirm {
+                    file_name: file_name.to_string(),
+                    svc_type,
+                });
+                self.set_status(
+                    if lang.is_zh() {
+                        format!("成功导入 {file_name}")
+                    } else {
+                        format!("Imported {file_name}")
+                    },
+                    false,
+                );
+            }
+            // 未识别为向量 / 重排模型，或目标服务已选择同一模型。
+            None => {
+                if was_ignored {
+                    self.save_config();
+                }
+                let recognized = self
+                    .models
+                    .iter()
+                    .find(|m| m.file_name.eq_ignore_ascii_case(file_name))
+                    .map(|m| m.kind.service_type().is_some())
+                    .unwrap_or(false);
+                let same_selected = self
+                    .service_mgr
+                    .services
+                    .iter()
+                    .any(|svc| svc.config.model_file.eq_ignore_ascii_case(file_name));
+                self.set_status(
+                    if recognized || same_selected {
+                        if lang.is_zh() {
+                            format!("成功导入 {file_name}")
+                        } else {
+                            format!("Imported {file_name}")
+                        }
+                    } else if lang.is_zh() {
+                        format!("成功导入 {file_name}（未识别为向量或重排模型）")
+                    } else {
+                        format!("Imported {file_name} (not recognized as embedding or reranker)")
+                    },
+                    false,
+                );
+            }
+        }
+    }
+
+    /// 判断导入的模型是否会触发自动分配。
+    ///
+    /// 返回 `Some((svc_type, needs_confirm))`：`needs_confirm` 表示目标服务已有不同的
+    /// 模型、切换需要用户确认；返回 `None` 表示不触发分配。
+    fn pending_assign_target(&self, file_name: &str) -> Option<(ServiceType, bool)> {
         let kind = self
             .models
             .iter()
             .find(|model| model.file_name.eq_ignore_ascii_case(file_name))?
             .kind;
         let svc_type = kind.service_type()?;
+        let svc = self
+            .service_mgr
+            .services
+            .iter()
+            .find(|svc| svc.config.service_type == svc_type)?;
+        let current = svc.config.model_file.trim();
+        let needs_confirm = !current.is_empty() && !current.eq_ignore_ascii_case(file_name);
+        Some((svc_type, needs_confirm))
+    }
+
+    /// 把模型分配给对应服务并返回服务显示名（UI 文案用）。
+    fn apply_auto_assign(&mut self, file_name: &str, svc_type: ServiceType) -> &'static str {
         if let Some(svc) = self
             .service_mgr
             .services
@@ -234,8 +385,7 @@ impl RagGuiApp {
         {
             svc.config.model_file = file_name.to_string();
         }
-        self.save_config();
-        Some(svc_type.display_name(self.config.language))
+        svc_type.display_name(self.config.language)
     }
 
     fn perform_exit(&mut self) -> ! {
@@ -393,42 +543,44 @@ impl eframe::App for RagGuiApp {
             }
         }
 
-        // 后台模型导入完成时回写状态（复制在独立线程中，不阻塞 UI）。
-        let import_finished = self
-            .import_job
-            .as_ref()
-            .map(|job| job.is_finished())
-            .unwrap_or(false);
-        if import_finished {
-            let result = self.import_job.as_ref().and_then(|job| job.take_result());
-            self.import_job = None;
-            match result {
-                Some(Ok(name)) => {
-                    self.refresh_models();
-                    let matched = self.auto_assign_imported_model(&name);
-                    let msg = if let Some(label) = matched {
-                        if lang.is_zh() {
-                            format!("成功导入 {name}，已匹配到「{label}」")
-                        } else {
-                            format!("Imported {name}; matched to {label}")
-                        }
-                    } else {
-                        if lang.is_zh() {
-                            format!("成功导入 {name}（未识别为向量或重排模型）")
-                        } else {
-                            format!("Imported {name} (not recognized as embedding or reranker)")
-                        }
-                    };
-                    self.set_status(msg, false);
-                }
-                Some(Err(e)) => {
+        // 后台复制（导入 / 导出）完成时回写状态（复制在独立线程中，不阻塞 UI）。
+        if let Some(job) = self.import_job.take_if(|job| job.is_finished()) {
+            let direction = job.direction;
+            match job.take_result() {
+                Some(CopyOutcome::Done) if direction == CopyDirection::Export => {
                     self.set_status(
-                        format!("{}: {e}", lang.t("导入失败", "Import failed")),
-                        true,
+                        if lang.is_zh() {
+                            format!("成功导出 {}", job.file_name)
+                        } else {
+                            format!("Exported {}", job.file_name)
+                        },
+                        false,
                     );
+                }
+                Some(CopyOutcome::Done) => {
+                    self.finish_import(&job.file_name);
+                }
+                Some(CopyOutcome::Cancelled) => {
+                    self.set_status(
+                        if direction == CopyDirection::Import {
+                            lang.t("已取消导入", "Import cancelled").to_string()
+                        } else {
+                            lang.t("已取消导出", "Export cancelled").to_string()
+                        },
+                        false,
+                    );
+                }
+                Some(CopyOutcome::Failed(e)) => {
+                    let verb = if direction == CopyDirection::Import {
+                        lang.t("导入失败", "Import failed")
+                    } else {
+                        lang.t("导出失败", "Export failed")
+                    };
+                    self.set_status(format!("{verb}: {e}"), true);
                 }
                 None => {}
             }
+            self.cancel_requested = false;
         }
 
         // Repaint regularly for responsive logs and resource bars
@@ -602,6 +754,8 @@ impl eframe::App for RagGuiApp {
         // Modals
         self.render_delete_modal(&ctx);
         self.render_api_modal(&ctx);
+        self.render_import_conflict_modal(&ctx);
+        self.render_assign_confirm_modal(&ctx);
     }
 }
 
@@ -1061,6 +1215,10 @@ impl RagGuiApp {
         let mut do_open_dir = false;
         let mut do_restore_removed = false;
         let mut to_delete = None;
+        let mut to_export = None;
+        let mut do_cancel_copy = false;
+        let mut kind_selection: Option<ModelKind> = None;
+        let mut kind_changed: Option<String> = None;
 
         card_frame(self.config.dark_mode).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -1082,9 +1240,12 @@ impl RagGuiApp {
                             .color(Color32::WHITE),
                     )
                     .fill(p.primary);
-                    // 同一时间只允许一个导入任务，避免多个大文件同时抢占磁盘。
+                    // 同一时间只允许一个复制任务（导入 / 导出互斥），避免多个大文件同时抢占磁盘。
                     if ui
-                        .add_enabled(self.import_job.is_none(), import_btn)
+                        .add_enabled(
+                            self.import_job.is_none() && self.import_conflict.is_none(),
+                            import_btn,
+                        )
                         .clicked()
                     {
                         do_import = true;
@@ -1103,6 +1264,22 @@ impl RagGuiApp {
                         if ui.button(restore_label).clicked() {
                             do_restore_removed = true;
                         }
+                        // 展开逐个恢复的列表。
+                        let toggle_label = if self.show_removed { "▾" } else { "▸" };
+                        if ui
+                            .button(
+                                RichText::new(toggle_label)
+                                    .size(11.0)
+                                    .color(p.text_secondary),
+                            )
+                            .on_hover_text(lang.t(
+                                "展开已移除模型列表，可逐个恢复",
+                                "Expand the removed list to restore one by one",
+                            ))
+                            .clicked()
+                        {
+                            self.show_removed = !self.show_removed;
+                        }
                     }
 
                     ui.add_sized(
@@ -1115,18 +1292,62 @@ impl RagGuiApp {
 
             ui.add_space(4.0);
 
-            // 后台导入进度（复制在独立线程中进行，界面保持可交互）。
+            // 已移除模型：折叠区逐行恢复（P2-2）。
+            if !self.config.ignored_models.is_empty() && self.show_removed {
+                ui.label(
+                    RichText::new(
+                        lang.t("已移除（文件保留在磁盘）:", "Removed (files kept on disk):"),
+                    )
+                    .size(11.0)
+                    .color(p.text_muted),
+                );
+                let mut restore_single: Option<String> = None;
+                for name in self.config.ignored_models.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&name).size(11.5).color(p.text_secondary));
+                        let restore_btn = egui::Button::new(
+                            RichText::new(lang.t("恢复", "Restore"))
+                                .size(10.5)
+                                .color(p.accent),
+                        )
+                        .frame(false);
+                        if ui.add(restore_btn).clicked() {
+                            restore_single = Some(name.clone());
+                        }
+                    });
+                }
+                if let Some(name) = restore_single {
+                    self.config
+                        .ignored_models
+                        .retain(|n| !n.eq_ignore_ascii_case(&name));
+                    self.save_config();
+                    self.refresh_models();
+                    self.set_status(
+                        if lang.is_zh() {
+                            format!("已恢复: {name}")
+                        } else {
+                            format!("Restored: {name}")
+                        },
+                        false,
+                    );
+                }
+                ui.add_space(4.0);
+            }
+
+            // 后台复制进度（导入 / 导出共用，复制在独立线程中进行，界面保持可交互）。
             if let Some(job) = &self.import_job {
                 let progress_text = if lang.is_zh() {
                     format!(
-                        "正在导入 {}（{}/{}）",
+                        "正在{} {}（{}/{}）",
+                        job.direction.progress_label(lang),
                         job.file_name,
                         format_file_size(job.copied_bytes()),
                         format_file_size(job.total_bytes())
                     )
                 } else {
                     format!(
-                        "Importing {} ({}/{})",
+                        "{} {} ({}/{})",
+                        job.direction.progress_label(lang),
                         job.file_name,
                         format_file_size(job.copied_bytes()),
                         format_file_size(job.total_bytes())
@@ -1144,6 +1365,15 @@ impl RagGuiApp {
                             .desired_height(6.0)
                             .fill(p.accent),
                     );
+                    let cancel_btn = egui::Button::new(
+                        RichText::new(lang.t("取消", "Cancel"))
+                            .size(11.0)
+                            .color(p.warning),
+                    )
+                    .frame(false);
+                    if ui.add_enabled(!self.cancel_requested, cancel_btn).clicked() {
+                        do_cancel_copy = true;
+                    }
                 });
                 ui.add_space(4.0);
             }
@@ -1156,7 +1386,11 @@ impl RagGuiApp {
                 .filter(|m| query.is_empty() || m.file_name.to_lowercase().contains(&query))
                 .collect();
 
-            let render_table = |ui: &mut egui::Ui, to_delete: &mut Option<String>| {
+            let render_table = |ui: &mut egui::Ui,
+                                to_delete: &mut Option<String>,
+                                to_export: &mut Option<String>,
+                                kind_selection: &mut Option<ModelKind>,
+                                kind_changed: &mut Option<String>| {
                 const COL_TYPE: f32 = 90.0;
                 const COL_SIZE: f32 = 80.0;
                 const COL_DIM: f32 = 80.0;
@@ -1191,10 +1425,10 @@ impl RagGuiApp {
                     let is_in_use = active_model_files
                         .iter()
                         .any(|f| f.eq_ignore_ascii_case(&model.file_name));
-                    let (type_name, bg_color, fg_color) = match model.kind {
-                        ModelKind::Embedding => (model.kind.label(lang), p.soft_accent, p.accent),
-                        ModelKind::Rerank => (model.kind.label(lang), p.soft_success, p.success),
-                        ModelKind::Other => (model.kind.label(lang), p.soft_purple, p.purple),
+                    let (type_name, fg_color) = match model.kind {
+                        ModelKind::Embedding => (model.kind.label(lang), p.accent),
+                        ModelKind::Rerank => (model.kind.label(lang), p.success),
+                        ModelKind::Other => (model.kind.label(lang), p.purple),
                     };
                     let dim_text = model
                         .embedding_dim
@@ -1221,17 +1455,32 @@ impl RagGuiApp {
                         });
 
                         table_cell(ui, COL_TYPE, |ui| {
-                            egui::Frame::new()
-                                .fill(bg_color)
-                                .corner_radius(CornerRadius::same(3))
-                                .inner_margin(egui::Margin::symmetric(6, 1))
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        RichText::new(type_name)
-                                            .size(10.5)
-                                            .strong()
-                                            .color(fg_color),
-                                    );
+                            // 类型徽章即下拉菜单：手动修正类型（元数据 / 文件名识别的兜底）。
+                            egui::ComboBox::from_id_salt(format!("kind_{}", model.file_name))
+                                .selected_text(
+                                    RichText::new(type_name).size(10.5).strong().color(fg_color),
+                                )
+                                .width(COL_TYPE - 14.0)
+                                .show_ui(ui, |ui| {
+                                    for kind in
+                                        [ModelKind::Embedding, ModelKind::Rerank, ModelKind::Other]
+                                    {
+                                        let label = match kind {
+                                            ModelKind::Embedding => "Embedding",
+                                            ModelKind::Rerank => "Rerank",
+                                            ModelKind::Other => lang.t("其他", "Other"),
+                                        };
+                                        if ui
+                                            .selectable_value(
+                                                &mut *kind_selection,
+                                                Some(kind),
+                                                label,
+                                            )
+                                            .changed()
+                                        {
+                                            *kind_changed = Some(model.file_name.clone());
+                                        }
+                                    }
                                 });
                         });
 
@@ -1254,6 +1503,22 @@ impl RagGuiApp {
                         });
 
                         table_cell(ui, COL_ACTION, |ui| {
+                            // 导出对运行中的模型也允许（只读源文件）。
+                            let export_btn = egui::Button::new(
+                                RichText::new(lang.t("导出", "Export"))
+                                    .size(11.5)
+                                    .color(p.accent),
+                            )
+                            .frame(false);
+                            if ui
+                                .add_enabled(
+                                    self.import_job.is_none() && self.import_conflict.is_none(),
+                                    export_btn,
+                                )
+                                .clicked()
+                            {
+                                *to_export = Some(model.file_name.clone());
+                            }
                             if is_in_use {
                                 ui.label(
                                     RichText::new(lang.t("占用", "In use"))
@@ -1303,13 +1568,25 @@ impl RagGuiApp {
                 });
                 ui.add_space(12.0);
             } else if filtered_models.len() <= 6 {
-                render_table(ui, &mut to_delete);
+                render_table(
+                    ui,
+                    &mut to_delete,
+                    &mut to_export,
+                    &mut kind_selection,
+                    &mut kind_changed,
+                );
             } else {
                 egui::ScrollArea::vertical()
                     .max_height(160.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        render_table(ui, &mut to_delete);
+                        render_table(
+                            ui,
+                            &mut to_delete,
+                            &mut to_export,
+                            &mut kind_selection,
+                            &mut kind_changed,
+                        );
                     });
             }
         });
@@ -1331,7 +1608,7 @@ impl RagGuiApp {
         }
         if do_import {
             match self.model_mgr.import_model_dialog(lang) {
-                Ok(Some(job)) => {
+                Ok(Some((job, None))) => {
                     self.set_status(
                         if lang.is_zh() {
                             format!("正在后台导入模型: {}", job.file_name)
@@ -1342,6 +1619,11 @@ impl RagGuiApp {
                     );
                     self.import_job = Some(job);
                 }
+                // 目标已有同名文件：不启动复制，先弹冲突确认。
+                Ok(Some((_, Some(conflict)))) => {
+                    self.conflict_save_as = default_save_as_name(&conflict.dest_name);
+                    self.import_conflict = Some(conflict);
+                }
                 Ok(None) => {}
                 Err(e) => {
                     self.set_status(
@@ -1351,8 +1633,54 @@ impl RagGuiApp {
                 }
             }
         }
+        if do_cancel_copy && let Some(job) = &self.import_job {
+            job.request_cancel();
+            self.cancel_requested = true;
+            self.set_status(lang.t("正在取消复制…", "Cancelling copy…"), false);
+        }
+        if let Some(model_name) = to_export {
+            match self.model_mgr.export_model_dialog(&model_name, lang) {
+                Ok(Some((job, None))) => {
+                    self.set_status(
+                        if lang.is_zh() {
+                            format!("正在后台导出模型: {}", job.file_name)
+                        } else {
+                            format!("Exporting model in the background: {}", job.file_name)
+                        },
+                        false,
+                    );
+                    self.import_job = Some(job);
+                }
+                // 导出目标已存在：先弹冲突确认。
+                Ok(Some((_, Some(conflict)))) => {
+                    self.conflict_save_as = default_save_as_name(&conflict.dest_name);
+                    self.import_conflict = Some(conflict);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    self.set_status(
+                        format!("{}: {e}", lang.t("导出失败", "Export failed")),
+                        true,
+                    );
+                }
+            }
+        }
         if let Some(file_name) = to_delete {
             self.delete_confirm_file = Some(file_name);
+        }
+        if let (Some(file_name), Some(kind)) = (&kind_changed, kind_selection) {
+            // 手动修正类型：写入 model_kinds 覆盖，持久化并刷新下拉过滤。
+            self.config.model_kinds.insert(file_name.clone(), kind);
+            self.save_config();
+            self.refresh_models();
+            self.set_status(
+                if lang.is_zh() {
+                    format!("已将 {} 的类型修正为 {}", file_name, kind.label(lang))
+                } else {
+                    format!("{} kind set to {}", file_name, kind.label(lang))
+                },
+                false,
+            );
         }
     }
 
@@ -1623,6 +1951,305 @@ impl RagGuiApp {
         }
     }
 
+    /// 导入 / 导出同名冲突弹窗：覆盖 / 另存为 / 取消。
+    ///
+    /// 覆盖前检查目标是否被运行中的服务占用；Windows 下对 llama-server 已打开的
+    /// 文件改名会失败，也不应动运行中模型的磁盘文件。
+    fn render_import_conflict_modal(&mut self, ctx: &egui::Context) {
+        let lang = self.lang();
+        let p = palette(self.config.dark_mode);
+        let Some(conflict) = self.import_conflict.clone() else {
+            return;
+        };
+
+        let mut action: Option<ConflictAction> = None;
+        egui::Window::new(lang.t("文件名冲突", "File name conflict"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let text = if lang.is_zh() {
+                    format!(
+                        "目标位置已存在同名文件：{}\n\n已有文件: {}\n新文件: {}\n\n可选择覆盖、另存为新名称，或取消本次{}。",
+                        conflict.dest_name,
+                        format_file_size(conflict.dest_size),
+                        format_file_size(conflict.source_size),
+                        lang.t("导入", "import")
+                    )
+                } else {
+                    format!(
+                        "A file with the same name already exists: {}\n\nExisting: {}\nNew file: {}\n\nOverwrite, save under a new name, or cancel the {}.",
+                        conflict.dest_name,
+                        format_file_size(conflict.dest_size),
+                        format_file_size(conflict.source_size),
+                        lang.t("import", "import")
+                    )
+                };
+                ui.label(text);
+                ui.add_space(8.0);
+
+                // 提示：如果这是之前「移除」过的模型，可以从恢复入口找回。
+                let was_ignored = self
+                    .config
+                    .ignored_models
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&conflict.dest_name));
+                if was_ignored {
+                    ui.label(
+                        RichText::new(lang.t(
+                            "该模型此前被移除过，也可通过右上角「恢复已移除 (N)」重新显示。",
+                            "This model was removed before; use Restore removed (N) to show it again.",
+                        ))
+                        .size(11.0)
+                        .color(p.text_muted),
+                    );
+                    ui.add_space(4.0);
+                }
+
+                // 覆盖守卫：目标被运行中的服务占用时禁止覆盖。
+                let dest_in_use = self
+                    .get_active_model_files()
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&conflict.dest_name));
+
+                // 另存为输入行
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(lang.t("另存为:", "Save as:"))
+                            .size(11.5)
+                            .color(p.text_secondary),
+                    );
+                    ui.add_sized(
+                        [260.0, CONTROL_HEIGHT],
+                        egui::TextEdit::singleline(&mut self.conflict_save_as)
+                            .hint_text(lang.t("输入新文件名", "Enter a new file name")),
+                    );
+                });
+                let save_as = self.conflict_save_as.trim().to_string();
+                let save_as_invalid_reason =
+        validate_model_file_name(&save_as, &conflict.dest_name, lang);
+                if let Some(reason) = &save_as_invalid_reason {
+                    ui.label(RichText::new(reason.clone()).size(10.5).color(p.danger));
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    // 覆盖
+                    let overwrite_btn = egui::Button::new(
+                        RichText::new(lang.t("覆盖", "Overwrite")).color(Color32::WHITE),
+                    )
+                    .fill(p.danger);
+                    if ui
+                        .add_enabled(!dest_in_use, overwrite_btn)
+                        .on_disabled_hover_text(lang.t(
+                            "该模型正在运行，请先停止再覆盖",
+                            "Stop the running model before overwriting it",
+                        ))
+                        .clicked()
+                    {
+                        action = Some(ConflictAction::Overwrite);
+                    }
+                    // 另存为
+                    let can_save_as = save_as_invalid_reason.is_none();
+                    if ui
+                        .add_enabled(can_save_as, egui::Button::new(lang.t("另存为", "Save as")))
+                        .clicked()
+                    {
+                        action = Some(ConflictAction::SaveAs(save_as.clone()));
+                    }
+                    if ui.button(lang.t("取消", "Cancel")).clicked() {
+                        action = Some(ConflictAction::Cancel);
+                    }
+                });
+                if dest_in_use {
+                    ui.label(
+                        RichText::new(lang.t(
+                            "目标模型正在运行，无法覆盖；可先停止模型或另存为新名称。",
+                            "The target model is running; stop it first or save under a new name.",
+                        ))
+                        .size(11.0)
+                        .color(p.warning),
+                    );
+                }
+            });
+
+        let Some(action) = action else {
+            return;
+        };
+        self.import_conflict = None;
+        match action {
+            ConflictAction::Cancel => {}
+            ConflictAction::Overwrite => {
+                // 覆盖前再次检查占用（弹窗打开期间状态可能变化）。
+                if self
+                    .get_active_model_files()
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&conflict.dest_name))
+                {
+                    self.set_status(
+                        lang.t(
+                            "模型正在运行，无法覆盖，请先停止",
+                            "The model is running; stop it before overwriting",
+                        ),
+                        true,
+                    );
+                    return;
+                }
+                self.start_copy_from_conflict(&conflict, &conflict.dest_name);
+            }
+            ConflictAction::SaveAs(new_name) => {
+                // 另存为的目标也不能与目标目录中已有文件重名。
+                let exists = conflict
+                    .dest_path
+                    .parent()
+                    .map(|dir| dir.join(&new_name).exists())
+                    .unwrap_or(false);
+                if exists {
+                    self.set_status(
+                        if lang.is_zh() {
+                            format!("目标目录中已存在同名文件: {new_name}")
+                        } else {
+                            format!("A file with the same name already exists: {new_name}")
+                        },
+                        true,
+                    );
+                } else {
+                    self.start_copy_from_conflict(&conflict, &new_name);
+                }
+            }
+        }
+    }
+
+    /// 冲突弹窗决策后启动（或重启）复制线程。
+    fn start_copy_from_conflict(&mut self, conflict: &ImportConflict, dest_name: &str) {
+        let lang = self.lang();
+        // 冲突发生在导入或导出，取决于源路径是否在 base_dir 下。
+        let is_import = conflict.source_path.parent() != Some(self.base_dir.as_path());
+        // 覆盖与另存为都基于冲突记录里的原目标目录：另存为只替换文件名。
+        let dest_path = conflict
+            .dest_path
+            .parent()
+            .map(|dir| dir.join(dest_name))
+            .unwrap_or_else(|| std::path::PathBuf::from(dest_name));
+        if let Some(job) = self.model_mgr.copy_file_with_name(
+            &conflict.source_path,
+            &dest_path,
+            dest_name,
+            if is_import {
+                CopyDirection::Import
+            } else {
+                CopyDirection::Export
+            },
+            lang,
+        ) {
+            self.set_status(
+                if lang.is_zh() {
+                    format!(
+                        "正在后台{}: {}",
+                        job.direction.progress_label(lang),
+                        dest_name
+                    )
+                } else {
+                    format!(
+                        "{} in the background: {}",
+                        job.direction.progress_label(lang),
+                        dest_name
+                    )
+                },
+                false,
+            );
+            self.import_job = Some(job);
+        } else {
+            self.set_status(
+                lang.t(
+                    "复制预检失败，未开始复制",
+                    "Copy pre-check failed; nothing was started",
+                ),
+                true,
+            );
+        }
+    }
+
+    /// 自动分配确认弹窗：目标服务已有不同的模型，切换前征询用户。
+    fn render_assign_confirm_modal(&mut self, ctx: &egui::Context) {
+        let lang = self.lang();
+        let p = palette(self.config.dark_mode);
+        let Some(confirm) = self.assign_confirm.clone() else {
+            return;
+        };
+
+        let mut decision: Option<bool> = None;
+        let title = if lang.is_zh() {
+            format!("切换 {} 模型？", confirm.svc_type.display_name(lang))
+        } else {
+            format!("Switch the {} model?", confirm.svc_type.display_name(lang))
+        };
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let current = self
+                    .service_mgr
+                    .services
+                    .iter()
+                    .find(|svc| svc.config.service_type == confirm.svc_type)
+                    .map(|svc| svc.config.model_file.clone())
+                    .unwrap_or_default();
+                let text = if lang.is_zh() {
+                    format!(
+                        "刚导入的 {} 可以分配给{}服务。\n\n当前选择: {}\n切换为: {}",
+                        confirm.file_name,
+                        confirm.svc_type.display_name(lang),
+                        short_model_name(&current),
+                        short_model_name(&confirm.file_name)
+                    )
+                } else {
+                    format!(
+                        "The imported {} can be assigned to the {} service.\n\nCurrent: {}\nSwitch to: {}",
+                        confirm.file_name,
+                        confirm.svc_type.display_name(lang),
+                        short_model_name(&current),
+                        short_model_name(&confirm.file_name)
+                    )
+                };
+                ui.label(text);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let switch_btn = egui::Button::new(
+                        RichText::new(lang.t("切换", "Switch")).color(Color32::WHITE),
+                    )
+                    .fill(p.primary);
+                    if ui.add(switch_btn).clicked() {
+                        decision = Some(true);
+                    }
+                    if ui
+                        .button(lang.t("仅导入，不切换", "Keep current"))
+                        .clicked()
+                    {
+                        decision = Some(false);
+                    }
+                });
+            });
+
+        let Some(switch) = decision else {
+            return;
+        };
+        self.assign_confirm = None;
+        if switch {
+            let label = self.apply_auto_assign(&confirm.file_name, confirm.svc_type);
+            self.save_config();
+            self.set_status(
+                if lang.is_zh() {
+                    format!("已切换为 {}（{}）", confirm.file_name, label)
+                } else {
+                    format!("Switched to {} ({})", confirm.file_name, label)
+                },
+                false,
+            );
+        }
+    }
+
     fn render_api_modal(&mut self, ctx: &egui::Context) {
         let lang = self.lang();
         let p = palette(self.config.dark_mode);
@@ -1839,6 +2466,7 @@ impl RagGuiApp {
         let p = palette(self.config.dark_mode);
         let dark = self.config.dark_mode;
         let mut save_ports = false;
+        let mut auto_assign_changed = false;
         let mut redetect_llama = false;
         let mut pick_llama = false;
         let mut open_hf = false;
@@ -2063,8 +2691,23 @@ impl RagGuiApp {
                             "Stop models started by this app when exiting",
                         ),
                     );
+                    let before = self.config.auto_assign_imported;
+                    ui.checkbox(
+                        &mut self.config.auto_assign_imported,
+                        lang.t(
+                            "导入模型后自动分配给对应服务",
+                            "Auto-assign imported models to their service",
+                        ),
+                    );
+                    if before != self.config.auto_assign_imported {
+                        auto_assign_changed = true;
+                    }
                 });
             });
+
+        if auto_assign_changed {
+            self.save_config();
+        }
 
         if save_ports && self.apply_port_drafts(true) {
             if self.service_mgr.has_pending_port_changes() {
@@ -2281,6 +2924,55 @@ fn status_text(lang: Language, status: &ServiceStatus) -> String {
         ServiceStatus::Stopped => lang.t("已停止", "Stopped").to_string(),
         ServiceStatus::Failed(_) => lang.t("失败", "Failed").to_string(),
     }
+}
+
+/// 冲突弹窗里用户的选择。
+enum ConflictAction {
+    Overwrite,
+    SaveAs(String),
+    Cancel,
+}
+
+/// 校验「另存为」输入的新模型文件名；返回 None 表示合法。
+fn validate_model_file_name(name: &str, current_name: &str, lang: Language) -> Option<String> {
+    if name.is_empty() {
+        return Some(
+            lang.t("文件名不能为空", "File name cannot be empty")
+                .to_string(),
+        );
+    }
+    if name.contains('\\') || name.contains('/') {
+        return Some(
+            lang.t("文件名不能包含 \\ 或 /", "File name cannot contain \\ or /")
+                .to_string(),
+        );
+    }
+    if name.eq_ignore_ascii_case(current_name) {
+        return Some(
+            lang.t(
+                "新文件名与现有文件相同",
+                "New name matches the existing file",
+            )
+            .to_string(),
+        );
+    }
+    None
+}
+
+/// 同名冲突「另存为」的默认名：在扩展名前追加 ` (1)`；已有序号则递增。
+fn default_save_as_name(dest_name: &str) -> String {
+    let (stem, ext) = match dest_name.rfind('.') {
+        Some(pos) => (&dest_name[..pos], &dest_name[pos..]),
+        None => (dest_name, ""),
+    };
+    // 若名字已以 " (N)" 结尾，递增 N。
+    if let Some(close) = stem.rfind(')')
+        && let Some(open) = stem[..close].rfind(" (")
+        && let Ok(n) = stem[open + 2..close].parse::<u32>()
+    {
+        return format!("{} ({}){}", &stem[..open], n + 1, ext);
+    }
+    format!("{stem} (1){ext}")
 }
 
 fn short_model_name(name: &str) -> String {

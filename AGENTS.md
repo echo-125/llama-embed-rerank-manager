@@ -20,10 +20,9 @@ llama.cpp（`llama-server`）的两个检索服务 —— 文本向量化（默�
 
 - 构建：`cargo build --release`（Rust edition 2024，无独立依赖安装步骤）
 - 开发运行：`cargo run`（debug 保留控制台；release 使用 windows_subsystem，隐藏控制台）
-- 产物：`target/release/llama-rag-gui.exe`；根目录 `llama-rag-gui.exe` 是手动复制的发布副本
+- 产物：`target/release/llama-rag-gui.exe`；仓库根就是本目录，发布副本 `llama-rag-gui.exe` 复制到**上一级**目录
 - 格式 / 检查：`cargo fmt` / `cargo clippy`
 - 测试：`cargo test`
-- 无 GUI 启停：`start-rag-servers.cmd [detach|status|stop]`（本地辅助脚本，不随仓库发布）
 - 健康检查：`Invoke-RestMethod http://127.0.0.1:9932/health`
 
 构建前置：
@@ -33,6 +32,9 @@ llama.cpp（`llama-server`）的两个检索服务 —— 文本向量化（默�
 - `llama.exe` 由 Llama 桌面端提供（`%LOCALAPPDATA%\Microsoft\WindowsApps\llama.exe`），不随仓库分发
 
 ## Project layout
+
+仓库只包含源码、文档与资源；模型、发布 exe、`config.json`、`logs/` 都在仓库根之外（本目录的**上一级**
+`E:\LlamaModels`），由程序按 exe 所在目录扫描，不要提交进仓库。
 
 - `src/main.rs` — eframe 应用：模型运行 / 模型文件 / 运行日志 / 设置，托盘事件，明暗与中英文切换，弹窗
 - `src/service.rs` — `ServiceType` / `ServiceConfig` / `ServiceManager`：向量与重排服务的拉起、健康检查、
@@ -49,17 +51,13 @@ llama.cpp（`llama-server`）的两个检索服务 —— 文本向量化（默�
 - `assets/` — 图标源文件与构建资源：`llama-logo.svg`、`llama.ico`、`logo_32.rgba`、`logo_128.rgba`、`screenshot.png`
 - `build.rs` — 嵌入 Windows exe 图标
 - `start-gui.cmd` — 双击启动 GUI
-- `start-rag-servers.ps1` / `.cmd` — 本地无 GUI 启停脚本（已忽略，不随仓库发布）；读取 `config.json` 的端口、模型与 llama 路径
-- `gguf-info.ps1` — 本地 GGUF 信息工具（已忽略，不随仓库发布）
-- `logs/` — 本地运行日志（已忽略，不随仓库发布）
+- `logs/`、`config.json`、`*.gguf`、发布副本 `llama-rag-gui.exe` — 位于上一级目录，不在本仓库内
 - `.ref-m3u8/` — 外部 UI 参考代码，不参与构建，不要提交
 
 ## Architecture notes
 
-- **两条服务管理路径**：GUI（公开）与本地 PowerShell 启动脚本（已忽略，不随仓库发布）。默认端口、模型名与
-  llama-server 参数分别位于 `ServiceType` 和 `start-rag-servers.ps1` 的 `$services`；GUI 保存的端口、
-  模型选择与 llama 路径写入 `config.json`，脚本启动时会读取端口与 llama 路径。改模型、参数或默认端口时
-  仍要同时检查两边。
+- **唯一服务管理路径是 GUI**：默认端口、模型名与 llama-server 参数集中在 `ServiceType`；端口、模型选择与
+  llama 路径保存在 `config.json`。改模型、参数或默认端口只需改 `src/service.rs` 一处。
 - **服务类型边界**：`ServiceType::ALL` 只有 `Embedding` 与 `Rerank` 两项，是服务顺序与配置持久化的唯一来源。
   新增能力若不属于这两类，不要往这里加。
 - **端口状态**：停止状态下模型行可直接编辑端口（与设置页共享草稿值）；运行中的模型保存端口后会先记入
@@ -69,11 +67,11 @@ llama.cpp（`llama-server`）的两个检索服务 —— 文本向量化（默�
 - **移除导入不是删除**：模型文件页的「移除」只把文件名写入 `ignored_models` 并从列表隐藏，磁盘文件保留；
   若该模型被停止中的服务选中会同时清空选择。页面提供「恢复已移除」入口。
 - **接入模型名**：启动时传 `--alias`，值为所选模型文件名去掉 `.gguf`；API 弹窗展示同一名称。改规则要同步
-  `model_alias`、`start_service` 的参数和 `start-rag-servers.ps1`。
+  `model_alias` 与 `start_service` 的参数。
 - **PID 文件格式**：`{service}.pid` 为两行，第一行 PID，第二行启动时实际使用的端口。重启 GUI 后通过 PID 文件
   收养进程时按文件里的端口做健康检查，因此不能只写 PID。
 - **启动命令日志**：`start_service` 会把完整 llama-server 命令行写入运行日志，既是复现依据，也是与
-  `start-rag-servers.ps1` 的 `$services` 比对推理参数、发现两边漂移的第一手材料。
+  排查推理参数问题与复现故障的第一手材料。
 - **延迟重启**：`restart_service` 只停止并登记 300ms 延迟，真正的启动由 UI 循环调用
   `process_pending_restarts` 到点执行；不在 UI 线程上 sleep。手动 stop/start 会取消未决重启。
 - 基目录在运行时解析：当前工作目录 → 可执行文件同级目录 → `E:\LlamaModels`（见 `resolve_base_dir`）。
@@ -107,15 +105,15 @@ llama.cpp（`llama-server`）的两个检索服务 —— 文本向量化（默�
 ## PR & commit conventions
 
 - 从 `master` 分支开发；提交信息用 conventional commits（`feat:` / `fix:` / `docs:` / `refactor:`）
-- `.gitignore` 已忽略 `/target`、`/llama-rag-gui.exe`、`/config.json`、`*.gguf`、`*.part`、`/logs/`、
-  `/*.pid`、`/start-rag-servers.ps1`、`/start-rag-servers.cmd`、`/gguf-info.ps1`、`/.ref-m3u8/`。
+- `.gitignore` 已忽略 `/target`、`*.part`、`/.ref-m3u8/`；模型、`config.json`、`logs/`、PID 与发布 exe 都在
+  仓库外（上一级目录），本来就不入库。
   即便如此仍请显式 `git add <file>`，不要 `git add -A`
 - 新增运行期产物（pid / log / part 文件）时，先补 `.gitignore` 再提交
 
 ## Security
 
 - 两个服务只监听 `127.0.0.1` 且无鉴权。若改 `--host 0.0.0.0` 对外暴露，必须同时加 `--api-key`
-- 不要把 API Key 或机器相关的绝对路径写进代码；默认模型名/端口集中在 `start-rag-servers.ps1` 的
+
   `$services` 与 `src/service.rs` 的 `ServiceType` 中
 - `config.json` 可能包含本机路径，已被忽略；不要提交
 - 生成的 `.pid` 文件由脚本/管理器自动维护，不要手动编辑或删除正在运行服务的 PID 文件

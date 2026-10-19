@@ -24,9 +24,13 @@ pub struct Palette {
     pub warning: Color32,
     pub purple: Color32,
 
+    /// 软背景色：徽章 / 危险按钮底色。部分字段当前仅个别控件使用。
+    #[allow(dead_code)]
     pub soft_accent: Color32,
+    #[allow(dead_code)]
     pub soft_success: Color32,
     pub soft_danger: Color32,
+    #[allow(dead_code)]
     pub soft_purple: Color32,
 
     pub hover_bg: Color32,

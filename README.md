@@ -21,7 +21,9 @@
 ## 功能
 
 - 一键启动 / 停止 / 重启向量与重排模型，显示状态、PID 与健康检查结果
-- 按类型选择 GGUF 模型；导入后自动识别并分配
+- 按类型选择 GGUF 模型；导入前预检（GGUF 真伪 / 磁盘空间），可取消，同名冲突可覆盖或另存为
+- 导入完成后自动识别并分配；已有选择时先确认，不静默覆盖
+- 模型可导出到任意目录（后台复制、可取消）；运行中的模型也允许导出
 - 模型文件页显示类型、大小与向量维度；移除导入不删除磁盘文件，可恢复
 - 实时日志、资源占用圆环、系统托盘
 - 亮色 / 暗色主题与中文 / English 切换，设置自动保存
@@ -45,12 +47,15 @@
 start-gui.cmd
 ```
 
-从源码构建：
+从源码构建（仓库根即本目录）：
 
 ```bat
 cargo build --release
-copy target\release\llama-rag-gui.exe .
+copy target\release\llama-rag-gui.exe ..\
 ```
+
+模型 `.gguf`、`config.json` 与发布用的 `llama-rag-gui.exe` 在**上一级目录**，程序启动时从 exe 所在目录
+加载模型，所以发布时要先把 exe 复制到上一级。
 
 详见 [安装与运行](docs/getting-started.md)。
 

@@ -20,6 +20,12 @@ pub struct AppConfig {
     /// 已从模型文件页移除、但保留在磁盘上的模型文件名。
     #[serde(default)]
     pub ignored_models: Vec<String>,
+    /// 导入完成后是否按模型类型自动分配给对应服务（默认开启）。
+    #[serde(default = "default_true")]
+    pub auto_assign_imported: bool,
+    /// 用户手动修正的模型类型（文件名 -> 类型），优先于自动识别。
+    #[serde(default)]
+    pub model_kinds: std::collections::HashMap<String, crate::model_mgr::ModelKind>,
     #[serde(default)]
     pub llama_exe_path: Option<String>,
     #[serde(default)]
@@ -36,6 +42,8 @@ impl Default for AppConfig {
             embedding_model: None,
             rerank_model: None,
             ignored_models: Vec::new(),
+            auto_assign_imported: true,
+            model_kinds: std::collections::HashMap::new(),
             llama_exe_path: None,
             dark_mode: false,
             language: Language::Zh,
@@ -49,6 +57,10 @@ fn default_embedding_port() -> u16 {
 
 fn default_rerank_port() -> u16 {
     9933
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub fn config_path(base_dir: &Path) -> PathBuf {
@@ -128,6 +140,7 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_mgr::ModelKind;
 
     #[test]
     fn config_round_trip_and_defaults() {
@@ -167,6 +180,20 @@ mod tests {
         assert!(!partial.dark_mode);
         assert_eq!(partial.language, Language::Zh);
         assert!(partial.ignored_models.is_empty());
+        assert!(partial.auto_assign_imported);
+        assert!(partial.model_kinds.is_empty());
+
+        // model_kinds 读写往返
+        let mut config = AppConfig::default();
+        config
+            .model_kinds
+            .insert("weird.gguf".to_string(), ModelKind::Rerank);
+        config.save(&dir).unwrap();
+        let loaded = AppConfig::load(&dir);
+        assert_eq!(
+            loaded.model_kinds.get("weird.gguf"),
+            Some(&ModelKind::Rerank)
+        );
 
         let mut config = AppConfig::default();
         config.set_port(ServiceType::Rerank, 10035);
