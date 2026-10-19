@@ -3,11 +3,14 @@
 mod config;
 mod icon;
 mod lang;
+mod modals;
 mod model_mgr;
 mod monitor;
+mod pdh;
 mod service;
 mod theme;
 mod tray;
+mod ui;
 
 use std::fs;
 use std::os::windows::process::CommandExt;
@@ -23,9 +26,13 @@ use model_mgr::{
     cleanup_part_files, format_file_size,
 };
 use monitor::Monitor;
-use service::{LogLevel, ServiceManager, ServiceStatus, ServiceType, find_llama_exe, model_alias};
+use service::{LogLevel, ServiceManager, ServiceStatus, ServiceType, find_llama_exe};
 use theme::{CONTROL_HEIGHT, apply_theme, card_frame, palette};
 use tray::{SystemTray, TrayAction, check_tray_events};
+use ui::{
+    configure_fonts, default_save_as_name, render_ring_metric, section_title, short_model_name,
+    small_btn, status_color, status_text, table_cell,
+};
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const HF_GGUF_URL: &str = "https://huggingface.co/models?library=gguf";
@@ -123,25 +130,22 @@ fn has_gguf_files(dir: &std::path::Path) -> bool {
     false
 }
 
+/// 解析模型目录（config.json、*.gguf、pid 文件所在目录）。
+///
+/// 不依赖任何本机固定路径：
+/// 1. 当前工作目录里有 GGUF 时用当前工作目录；
+/// 2. 否则用 exe 所在目录（发布形态：exe 与模型同级）；
+/// 3. 两者都没有 GGUF 时也以 exe 所在目录为准，首次使用可点「+ 导入」把模型放进来。
 fn resolve_base_dir() -> PathBuf {
-    // 1. 优先检查当前工作目录
-    if let Ok(cwd) = std::env::current_dir() {
-        if has_gguf_files(&cwd) {
-            return cwd;
-        }
+    if let Ok(cwd) = std::env::current_dir()
+        && has_gguf_files(&cwd)
+    {
+        return cwd;
     }
-    // 2. 检查可执行程序所在同级目录
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(parent) = exe_path.parent() {
-            if has_gguf_files(parent) {
-                return parent.to_path_buf();
-            }
-        }
-    }
-    // 3. 检查已知的默认目录 E:\LlamaModels
-    let default_path = PathBuf::from(r"E:\LlamaModels");
-    if default_path.exists() {
-        return default_path;
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(parent) = exe_path.parent()
+    {
+        return parent.to_path_buf();
     }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
@@ -484,11 +488,18 @@ impl eframe::App for RagGuiApp {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                         } else if id == tray.item_start_all.id() {
-                            self.service_mgr.start_all();
-                            self.set_status(
-                                lang.t("已发送全部模型启动指令", "Start signal sent to all models"),
-                                false,
-                            );
+                            // 与界面上的「全部启动」走同一条路径：先应用端口草稿，
+                            // 端口重复时拒绝启动，避免托盘入口绕过端口校验。
+                            if self.apply_port_drafts(true) {
+                                self.service_mgr.start_all();
+                                self.set_status(
+                                    lang.t(
+                                        "已发送全部模型启动指令",
+                                        "Start signal sent to all models",
+                                    ),
+                                    false,
+                                );
+                            }
                         } else if id == tray.item_stop_all.id() {
                             self.service_mgr.stop_all();
                             self.set_status(
@@ -1117,6 +1128,13 @@ impl RagGuiApp {
                             .min_size(egui::vec2(0.0, CONTROL_HEIGHT));
                             if ui.add(start_btn).clicked() {
                                 action_start = Some(i);
+                            }
+                            // 失败状态（如端口被占用）也要能点「测试」确认诊断结论，
+                            // 否则用户只能先重启服务才能验证。
+                            if matches!(svc.status, ServiceStatus::Failed(_))
+                                && ui.add(small_btn(lang.t("测试", "Test"))).clicked()
+                            {
+                                action_test = Some(i);
                             }
                         }
 
@@ -1784,10 +1802,11 @@ impl RagGuiApp {
                             LogLevel::Warn => p.warning,
                             LogLevel::Error => p.danger,
                         };
-                        let prefix_color = if item.service == "Embedding" {
-                            p.accent
-                        } else {
-                            p.success
+                        // 按来源类型取色：应用级日志（无类型）用中性色。
+                        let prefix_color = match item.service_type {
+                            Some(ServiceType::Embedding) => p.accent,
+                            Some(ServiceType::Rerank) => p.success,
+                            None => p.text_muted,
                         };
 
                         ui.horizontal(|ui| {
@@ -1860,604 +1879,6 @@ impl RagGuiApp {
                     p.text_strong
                 }));
             });
-        }
-    }
-
-    fn render_delete_modal(&mut self, ctx: &egui::Context) {
-        let lang = self.lang();
-        let p = palette(self.config.dark_mode);
-        if let Some(target_file) = self.delete_confirm_file.clone() {
-            egui::Window::new(lang.t("确认移除导入", "Remove import"))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .show(ctx, |ui| {
-                    let text = if lang.is_zh() {
-                        format!(
-                            "将从模型列表中移除以下模型，但不会删除磁盘文件：\n\n{target_file}"
-                        )
-                    } else {
-                        format!(
-                            "This hides the model from the list but keeps the file on disk:\n\n{target_file}"
-                        )
-                    };
-                    ui.label(text);
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(lang.t("移除", "Remove"))
-                                        .color(Color32::WHITE),
-                                )
-                                .fill(p.warning),
-                            )
-                            .clicked()
-                        {
-                            let in_use = self
-                                .get_active_model_files()
-                                .iter()
-                                .any(|name| name.eq_ignore_ascii_case(&target_file));
-                            if in_use {
-                                self.set_status(
-                                    lang.t(
-                                        "模型正在运行，请先停止再移除",
-                                        "Stop the model before removing it",
-                                    ),
-                                    true,
-                                );
-                            } else {
-                                if !self
-                                    .config
-                                    .ignored_models
-                                    .iter()
-                                    .any(|name| name.eq_ignore_ascii_case(&target_file))
-                                {
-                                    self.config.ignored_models.push(target_file.clone());
-                                }
-                                for svc in &mut self.service_mgr.services {
-                                    if svc.config.model_file.eq_ignore_ascii_case(&target_file)
-                                        && !matches!(
-                                            svc.status,
-                                            ServiceStatus::Running { .. }
-                                                | ServiceStatus::Starting { .. }
-                                        )
-                                    {
-                                        svc.config.model_file.clear();
-                                    }
-                                }
-                                self.save_config();
-                                self.refresh_models();
-                                self.set_status(
-                                    if lang.is_zh() {
-                                        format!(
-                                            "已移除导入：{target_file}（文件仍保留在磁盘）"
-                                        )
-                                    } else {
-                                        format!(
-                                            "Removed import: {target_file} (file kept on disk)"
-                                        )
-                                    },
-                                    false,
-                                );
-                            }
-                            self.delete_confirm_file = None;
-                        }
-                        if ui.button(lang.t("取消", "Cancel")).clicked() {
-                            self.delete_confirm_file = None;
-                        }
-                    });
-                });
-        }
-    }
-
-    /// 导入 / 导出同名冲突弹窗：覆盖 / 另存为 / 取消。
-    ///
-    /// 覆盖前检查目标是否被运行中的服务占用；Windows 下对 llama-server 已打开的
-    /// 文件改名会失败，也不应动运行中模型的磁盘文件。
-    fn render_import_conflict_modal(&mut self, ctx: &egui::Context) {
-        let lang = self.lang();
-        let p = palette(self.config.dark_mode);
-        let Some(conflict) = self.import_conflict.clone() else {
-            return;
-        };
-
-        let mut action: Option<ConflictAction> = None;
-        egui::Window::new(lang.t("文件名冲突", "File name conflict"))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                let text = if lang.is_zh() {
-                    format!(
-                        "目标位置已存在同名文件：{}\n\n已有文件: {}\n新文件: {}\n\n可选择覆盖、另存为新名称，或取消本次{}。",
-                        conflict.dest_name,
-                        format_file_size(conflict.dest_size),
-                        format_file_size(conflict.source_size),
-                        lang.t("导入", "import")
-                    )
-                } else {
-                    format!(
-                        "A file with the same name already exists: {}\n\nExisting: {}\nNew file: {}\n\nOverwrite, save under a new name, or cancel the {}.",
-                        conflict.dest_name,
-                        format_file_size(conflict.dest_size),
-                        format_file_size(conflict.source_size),
-                        lang.t("import", "import")
-                    )
-                };
-                ui.label(text);
-                ui.add_space(8.0);
-
-                // 提示：如果这是之前「移除」过的模型，可以从恢复入口找回。
-                let was_ignored = self
-                    .config
-                    .ignored_models
-                    .iter()
-                    .any(|n| n.eq_ignore_ascii_case(&conflict.dest_name));
-                if was_ignored {
-                    ui.label(
-                        RichText::new(lang.t(
-                            "该模型此前被移除过，也可通过右上角「恢复已移除 (N)」重新显示。",
-                            "This model was removed before; use Restore removed (N) to show it again.",
-                        ))
-                        .size(11.0)
-                        .color(p.text_muted),
-                    );
-                    ui.add_space(4.0);
-                }
-
-                // 覆盖守卫：目标被运行中的服务占用时禁止覆盖。
-                let dest_in_use = self
-                    .get_active_model_files()
-                    .iter()
-                    .any(|n| n.eq_ignore_ascii_case(&conflict.dest_name));
-
-                // 另存为输入行
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(lang.t("另存为:", "Save as:"))
-                            .size(11.5)
-                            .color(p.text_secondary),
-                    );
-                    ui.add_sized(
-                        [260.0, CONTROL_HEIGHT],
-                        egui::TextEdit::singleline(&mut self.conflict_save_as)
-                            .hint_text(lang.t("输入新文件名", "Enter a new file name")),
-                    );
-                });
-                let save_as = self.conflict_save_as.trim().to_string();
-                let save_as_invalid_reason =
-        validate_model_file_name(&save_as, &conflict.dest_name, lang);
-                if let Some(reason) = &save_as_invalid_reason {
-                    ui.label(RichText::new(reason.clone()).size(10.5).color(p.danger));
-                }
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    // 覆盖
-                    let overwrite_btn = egui::Button::new(
-                        RichText::new(lang.t("覆盖", "Overwrite")).color(Color32::WHITE),
-                    )
-                    .fill(p.danger);
-                    if ui
-                        .add_enabled(!dest_in_use, overwrite_btn)
-                        .on_disabled_hover_text(lang.t(
-                            "该模型正在运行，请先停止再覆盖",
-                            "Stop the running model before overwriting it",
-                        ))
-                        .clicked()
-                    {
-                        action = Some(ConflictAction::Overwrite);
-                    }
-                    // 另存为
-                    let can_save_as = save_as_invalid_reason.is_none();
-                    if ui
-                        .add_enabled(can_save_as, egui::Button::new(lang.t("另存为", "Save as")))
-                        .clicked()
-                    {
-                        action = Some(ConflictAction::SaveAs(save_as.clone()));
-                    }
-                    if ui.button(lang.t("取消", "Cancel")).clicked() {
-                        action = Some(ConflictAction::Cancel);
-                    }
-                });
-                if dest_in_use {
-                    ui.label(
-                        RichText::new(lang.t(
-                            "目标模型正在运行，无法覆盖；可先停止模型或另存为新名称。",
-                            "The target model is running; stop it first or save under a new name.",
-                        ))
-                        .size(11.0)
-                        .color(p.warning),
-                    );
-                }
-            });
-
-        let Some(action) = action else {
-            return;
-        };
-        self.import_conflict = None;
-        match action {
-            ConflictAction::Cancel => {}
-            ConflictAction::Overwrite => {
-                // 覆盖前再次检查占用（弹窗打开期间状态可能变化）。
-                if self
-                    .get_active_model_files()
-                    .iter()
-                    .any(|n| n.eq_ignore_ascii_case(&conflict.dest_name))
-                {
-                    self.set_status(
-                        lang.t(
-                            "模型正在运行，无法覆盖，请先停止",
-                            "The model is running; stop it before overwriting",
-                        ),
-                        true,
-                    );
-                    return;
-                }
-                self.start_copy_from_conflict(&conflict, &conflict.dest_name);
-            }
-            ConflictAction::SaveAs(new_name) => {
-                // 另存为的目标也不能与目标目录中已有文件重名。
-                let exists = conflict
-                    .dest_path
-                    .parent()
-                    .map(|dir| dir.join(&new_name).exists())
-                    .unwrap_or(false);
-                if exists {
-                    self.set_status(
-                        if lang.is_zh() {
-                            format!("目标目录中已存在同名文件: {new_name}")
-                        } else {
-                            format!("A file with the same name already exists: {new_name}")
-                        },
-                        true,
-                    );
-                } else {
-                    self.start_copy_from_conflict(&conflict, &new_name);
-                }
-            }
-        }
-    }
-
-    /// 冲突弹窗决策后启动（或重启）复制线程。
-    fn start_copy_from_conflict(&mut self, conflict: &ImportConflict, dest_name: &str) {
-        let lang = self.lang();
-        // 冲突发生在导入或导出，取决于源路径是否在 base_dir 下。
-        let is_import = conflict.source_path.parent() != Some(self.base_dir.as_path());
-        // 覆盖与另存为都基于冲突记录里的原目标目录：另存为只替换文件名。
-        let dest_path = conflict
-            .dest_path
-            .parent()
-            .map(|dir| dir.join(dest_name))
-            .unwrap_or_else(|| std::path::PathBuf::from(dest_name));
-        if let Some(job) = self.model_mgr.copy_file_with_name(
-            &conflict.source_path,
-            &dest_path,
-            dest_name,
-            if is_import {
-                CopyDirection::Import
-            } else {
-                CopyDirection::Export
-            },
-            lang,
-        ) {
-            self.set_status(
-                if lang.is_zh() {
-                    format!(
-                        "正在后台{}: {}",
-                        job.direction.progress_label(lang),
-                        dest_name
-                    )
-                } else {
-                    format!(
-                        "{} in the background: {}",
-                        job.direction.progress_label(lang),
-                        dest_name
-                    )
-                },
-                false,
-            );
-            self.import_job = Some(job);
-        } else {
-            self.set_status(
-                lang.t(
-                    "复制预检失败，未开始复制",
-                    "Copy pre-check failed; nothing was started",
-                ),
-                true,
-            );
-        }
-    }
-
-    /// 自动分配确认弹窗：目标服务已有不同的模型，切换前征询用户。
-    fn render_assign_confirm_modal(&mut self, ctx: &egui::Context) {
-        let lang = self.lang();
-        let p = palette(self.config.dark_mode);
-        let Some(confirm) = self.assign_confirm.clone() else {
-            return;
-        };
-
-        let mut decision: Option<bool> = None;
-        let title = if lang.is_zh() {
-            format!("切换 {} 模型？", confirm.svc_type.display_name(lang))
-        } else {
-            format!("Switch the {} model?", confirm.svc_type.display_name(lang))
-        };
-        egui::Window::new(title)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                let current = self
-                    .service_mgr
-                    .services
-                    .iter()
-                    .find(|svc| svc.config.service_type == confirm.svc_type)
-                    .map(|svc| svc.config.model_file.clone())
-                    .unwrap_or_default();
-                let text = if lang.is_zh() {
-                    format!(
-                        "刚导入的 {} 可以分配给{}服务。\n\n当前选择: {}\n切换为: {}",
-                        confirm.file_name,
-                        confirm.svc_type.display_name(lang),
-                        short_model_name(&current),
-                        short_model_name(&confirm.file_name)
-                    )
-                } else {
-                    format!(
-                        "The imported {} can be assigned to the {} service.\n\nCurrent: {}\nSwitch to: {}",
-                        confirm.file_name,
-                        confirm.svc_type.display_name(lang),
-                        short_model_name(&current),
-                        short_model_name(&confirm.file_name)
-                    )
-                };
-                ui.label(text);
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let switch_btn = egui::Button::new(
-                        RichText::new(lang.t("切换", "Switch")).color(Color32::WHITE),
-                    )
-                    .fill(p.primary);
-                    if ui.add(switch_btn).clicked() {
-                        decision = Some(true);
-                    }
-                    if ui
-                        .button(lang.t("仅导入，不切换", "Keep current"))
-                        .clicked()
-                    {
-                        decision = Some(false);
-                    }
-                });
-            });
-
-        let Some(switch) = decision else {
-            return;
-        };
-        self.assign_confirm = None;
-        if switch {
-            let label = self.apply_auto_assign(&confirm.file_name, confirm.svc_type);
-            self.save_config();
-            self.set_status(
-                if lang.is_zh() {
-                    format!("已切换为 {}（{}）", confirm.file_name, label)
-                } else {
-                    format!("Switched to {} ({})", confirm.file_name, label)
-                },
-                false,
-            );
-        }
-    }
-
-    fn render_api_modal(&mut self, ctx: &egui::Context) {
-        let lang = self.lang();
-        let p = palette(self.config.dark_mode);
-        let mut copied_label: Option<String> = None;
-        let mut close = false;
-
-        if let Some(svc_type) = self.api_modal_svc {
-            let (port, model_file, status) = match self
-                .service_mgr
-                .services
-                .iter()
-                .find(|svc| svc.config.service_type == svc_type)
-            {
-                Some(svc) => (
-                    svc.config.port,
-                    svc.config.model_file.clone(),
-                    svc.status.clone(),
-                ),
-                None => (
-                    svc_type.default_port(),
-                    svc_type.default_model().to_string(),
-                    ServiceStatus::Stopped,
-                ),
-            };
-            let status_col = status_color(&status, p);
-            let status_txt = status_text(lang, &status);
-            let base_url = format!("http://127.0.0.1:{port}");
-
-            let (endpoint_path, protocol) = match svc_type {
-                ServiceType::Embedding => (
-                    "/v1/embeddings",
-                    lang.t("OpenAI 兼容 · Embeddings", "OpenAI-compatible · Embeddings"),
-                ),
-                ServiceType::Rerank => (
-                    "/v1/rerank",
-                    lang.t(
-                        "Jina / Cohere 兼容 · Rerank",
-                        "Jina / Cohere-compatible · Rerank",
-                    ),
-                ),
-            };
-            let endpoint_url = format!("{base_url}{endpoint_path}");
-            let health_url = format!("{base_url}/health");
-            let title = if lang.is_zh() {
-                format!("{} 接口详情", svc_type.display_name(lang))
-            } else {
-                format!("{} API details", svc_type.display_name(lang))
-            };
-
-            egui::Window::new(title)
-                .title_bar(false)
-                .collapsible(false)
-                .resizable(false)
-                .default_width(500.0)
-                .min_width(500.0)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .frame(
-                    egui::Frame::new()
-                        .fill(p.surface)
-                        .stroke(egui::Stroke::new(1.0, p.border))
-                        .corner_radius(CornerRadius::same(8))
-                        .shadow(egui::epaint::Shadow {
-                            offset: [0, 3],
-                            blur: 8,
-                            spread: 0,
-                            color: Color32::from_black_alpha(45),
-                        })
-                        .inner_margin(egui::Margin {
-                            left: 10,
-                            right: 14,
-                            top: 6,
-                            bottom: 8,
-                        }),
-                )
-                .show(ctx, |ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(svc_type.display_name(lang))
-                                .strong()
-                                .size(13.0)
-                                .color(p.text_strong),
-                        );
-                        ui.colored_label(status_col, RichText::new(status_txt).size(11.0));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new(lang.t("关闭", "Close"))
-                                            .size(11.0)
-                                            .color(p.text_secondary),
-                                    )
-                                    .fill(p.surface)
-                                    .stroke(egui::Stroke::new(1.0, p.border))
-                                    .corner_radius(CornerRadius::same(5))
-                                    .min_size(egui::vec2(44.0, 20.0)),
-                                )
-                                .clicked()
-                            {
-                                close = true;
-                            }
-                        });
-                    });
-                    ui.separator();
-
-                    api_row(
-                        ui,
-                        ctx,
-                        lang,
-                        p,
-                        lang.t("模型类型", "Model type"),
-                        svc_type.display_name(lang),
-                        false,
-                    );
-                    let model_name = if model_file.trim().is_empty() {
-                        lang.t("未选择", "Not selected").to_string()
-                    } else {
-                        model_alias(&model_file)
-                    };
-                    if api_row(
-                        ui,
-                        ctx,
-                        lang,
-                        p,
-                        lang.t("模型", "Model"),
-                        &model_name,
-                        !model_file.trim().is_empty(),
-                    ) {
-                        copied_label = Some(lang.t("模型", "Model").to_string());
-                    }
-                    if svc_type == ServiceType::Embedding {
-                        let dim_text = self
-                            .models
-                            .iter()
-                            .find(|model| model.file_name.eq_ignore_ascii_case(&model_file))
-                            .and_then(|model| model.embedding_dim)
-                            .map(|dim| dim.to_string())
-                            .unwrap_or_else(|| lang.t("未知", "Unknown").to_string());
-                        api_row(
-                            ui,
-                            ctx,
-                            lang,
-                            p,
-                            lang.t("维度", "Dimension"),
-                            &dim_text,
-                            false,
-                        );
-                    }
-                    api_row(
-                        ui,
-                        ctx,
-                        lang,
-                        p,
-                        lang.t("协议", "Protocol"),
-                        protocol,
-                        false,
-                    );
-                    if api_row(
-                        ui,
-                        ctx,
-                        lang,
-                        p,
-                        lang.t("基础地址", "Base URL"),
-                        &base_url,
-                        true,
-                    ) {
-                        copied_label = Some(lang.t("基础地址", "Base URL").to_string());
-                    }
-                    if api_row(
-                        ui,
-                        ctx,
-                        lang,
-                        p,
-                        lang.t("调用接口", "Endpoint"),
-                        &endpoint_url,
-                        true,
-                    ) {
-                        copied_label = Some(lang.t("调用接口", "Endpoint").to_string());
-                    }
-                    if api_row(
-                        ui,
-                        ctx,
-                        lang,
-                        p,
-                        lang.t("健康检查", "Health check"),
-                        &health_url,
-                        true,
-                    ) {
-                        copied_label = Some(lang.t("健康检查", "Health check").to_string());
-                    }
-                    api_row(
-                        ui,
-                        ctx,
-                        lang,
-                        p,
-                        lang.t("鉴权", "Auth"),
-                        lang.t("无（仅本机）", "None (localhost only)"),
-                        false,
-                    );
-                });
-        }
-
-        if close {
-            self.api_modal_svc = None;
-        }
-        if let Some(label) = copied_label {
-            self.set_status(format!("{}: {label}", lang.t("已复制", "Copied")), false);
         }
     }
 
@@ -2805,235 +2226,6 @@ impl RagGuiApp {
         }
         active
     }
-}
-
-fn render_ring_metric(
-    ui: &mut egui::Ui,
-    label: &str,
-    percent: f32,
-    detail: String,
-    color: Color32,
-    p: theme::Palette,
-) {
-    ui.horizontal(|ui| {
-        let size = 38.0;
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-        let center = rect.center();
-        let radius = size * 0.5 - 3.5;
-        ui.painter()
-            .circle_stroke(center, radius, egui::Stroke::new(3.0, p.border));
-
-        let pct = percent.clamp(0.0, 100.0);
-        if pct > 0.0 {
-            let start = -std::f32::consts::FRAC_PI_2;
-            let sweep = std::f32::consts::TAU * pct / 100.0;
-            let segments = ((pct / 4.0).ceil() as usize).max(6);
-            let points: Vec<egui::Pos2> = (0..=segments)
-                .map(|i| {
-                    let angle = start + sweep * (i as f32 / segments as f32);
-                    center + egui::vec2(angle.cos(), angle.sin()) * radius
-                })
-                .collect();
-            ui.painter()
-                .add(egui::Shape::line(points, egui::Stroke::new(3.0, color)));
-        }
-
-        ui.painter().text(
-            center,
-            egui::Align2::CENTER_CENTER,
-            format!("{pct:.0}"),
-            egui::FontId::proportional(10.0),
-            p.text_strong,
-        );
-
-        ui.vertical(|ui| {
-            ui.label(RichText::new(label).size(11.0).strong().color(p.text));
-            ui.label(RichText::new(detail).size(9.5).color(p.text_muted));
-        });
-    });
-}
-
-fn api_row(
-    ui: &mut egui::Ui,
-    ctx: &egui::Context,
-    lang: Language,
-    p: theme::Palette,
-    label: &str,
-    value: &str,
-    copyable: bool,
-) -> bool {
-    let mut clicked = false;
-    ui.horizontal(|ui| {
-        ui.add_sized(
-            [80.0, 18.0],
-            egui::Label::new(RichText::new(label).size(11.0).color(p.text_secondary)),
-        );
-        if copyable {
-            ui.allocate_ui_with_layout(
-                egui::vec2(330.0, 18.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.add(
-                        egui::Label::new(RichText::new(value).monospace().size(10.5).color(p.text))
-                            .truncate()
-                            .selectable(true),
-                    )
-                    .on_hover_text(value);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(10.0);
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(lang.t("复制", "Copy"))
-                                        .size(10.5)
-                                        .color(p.accent),
-                                )
-                                .frame(false)
-                                .small()
-                                .min_size(egui::vec2(0.0, 16.0)),
-                            )
-                            .clicked()
-                        {
-                            ctx.copy_text(value.to_owned());
-                            clicked = true;
-                        }
-                    });
-                },
-            );
-        } else {
-            ui.label(RichText::new(value).size(11.0).color(p.text));
-        }
-    });
-    ui.separator();
-    clicked
-}
-
-fn status_color(status: &ServiceStatus, p: theme::Palette) -> Color32 {
-    match status {
-        ServiceStatus::Running { .. } => p.success,
-        ServiceStatus::Starting { .. } => p.warning,
-        ServiceStatus::Stopped => p.text_muted,
-        ServiceStatus::Failed(_) => p.danger,
-    }
-}
-
-fn status_text(lang: Language, status: &ServiceStatus) -> String {
-    match status {
-        ServiceStatus::Running { .. } => lang.t("运行中", "Running").to_string(),
-        ServiceStatus::Starting { .. } => lang.t("启动中…", "Starting…").to_string(),
-        ServiceStatus::Stopped => lang.t("已停止", "Stopped").to_string(),
-        ServiceStatus::Failed(_) => lang.t("失败", "Failed").to_string(),
-    }
-}
-
-/// 冲突弹窗里用户的选择。
-enum ConflictAction {
-    Overwrite,
-    SaveAs(String),
-    Cancel,
-}
-
-/// 校验「另存为」输入的新模型文件名；返回 None 表示合法。
-fn validate_model_file_name(name: &str, current_name: &str, lang: Language) -> Option<String> {
-    if name.is_empty() {
-        return Some(
-            lang.t("文件名不能为空", "File name cannot be empty")
-                .to_string(),
-        );
-    }
-    if name.contains('\\') || name.contains('/') {
-        return Some(
-            lang.t("文件名不能包含 \\ 或 /", "File name cannot contain \\ or /")
-                .to_string(),
-        );
-    }
-    if name.eq_ignore_ascii_case(current_name) {
-        return Some(
-            lang.t(
-                "新文件名与现有文件相同",
-                "New name matches the existing file",
-            )
-            .to_string(),
-        );
-    }
-    None
-}
-
-/// 同名冲突「另存为」的默认名：在扩展名前追加 ` (1)`；已有序号则递增。
-fn default_save_as_name(dest_name: &str) -> String {
-    let (stem, ext) = match dest_name.rfind('.') {
-        Some(pos) => (&dest_name[..pos], &dest_name[pos..]),
-        None => (dest_name, ""),
-    };
-    // 若名字已以 " (N)" 结尾，递增 N。
-    if let Some(close) = stem.rfind(')')
-        && let Some(open) = stem[..close].rfind(" (")
-        && let Ok(n) = stem[open + 2..close].parse::<u32>()
-    {
-        return format!("{} ({}){}", &stem[..open], n + 1, ext);
-    }
-    format!("{stem} (1){ext}")
-}
-
-fn short_model_name(name: &str) -> String {
-    const MAX: usize = 24;
-    if name.chars().count() > MAX {
-        let mut short: String = name.chars().take(MAX - 1).collect();
-        short.push('…');
-        short
-    } else {
-        name.to_string()
-    }
-}
-
-fn small_btn(text: &'static str) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text).size(11.0))
-        .small()
-        .min_size(egui::vec2(0.0, CONTROL_HEIGHT))
-}
-
-fn table_cell(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(width, 20.0),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.set_min_width(width);
-            add(ui);
-        },
-    );
-}
-
-fn section_title(ui: &mut egui::Ui, p: theme::Palette, text: &str) {
-    ui.label(RichText::new(text).strong().size(13.0).color(p.text_strong));
-}
-
-fn configure_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-
-    // 依次尝试常见的中文字体文件；都不可用时保持 egui 默认字体。
-    const FONT_CANDIDATES: [&str; 3] = [
-        r"C:\Windows\Fonts\msyh.ttc",   // 微软雅黑
-        r"C:\Windows\Fonts\simhei.ttf", // 中易黑体
-        r"C:\Windows\Fonts\simsun.ttc", // 中易宋体
-    ];
-    for font_path in FONT_CANDIDATES {
-        if let Ok(font_data) = std::fs::read(font_path) {
-            fonts.font_data.insert(
-                "cjk".to_owned(),
-                Arc::new(egui::FontData::from_owned(font_data)),
-            );
-
-            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-                family.insert(0, "cjk".to_owned());
-            }
-            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-                family.insert(0, "cjk".to_owned());
-            }
-            break;
-        }
-    }
-
-    ctx.set_fonts(fonts);
 }
 
 fn main() -> eframe::Result<()> {

@@ -6,9 +6,12 @@
 
 | 路径 | 说明 |
 |---|---|
-| `src/main.rs` | GUI 主体：模型运行 / 模型文件 / 运行日志 / 设置，主题 / 语言、弹窗、托盘事件 |
-| `src/service.rs` | 向量 / 重排模型的进程、健康检查、PID、端口、`--alias` |
-| `src/monitor.rs` | 内存 / 显存 / GPU 采样 |
+| `src/main.rs` | 应用状态、四个页签（模型运行 / 模型文件 / 运行日志 / 设置）、托盘事件与启动入口 |
+| `src/modals/` | 弹窗：移除确认、同名冲突、自动分配确认、接口详情（各一个文件） |
+| `src/ui.rs` | 跨页面复用的绘制小部件与纯函数（表格单元、状态色、文件名校验等） |
+| `src/service.rs` | 向量 / 重排模型的进程、健康检查、PID、端口、`--alias`、日志队列 |
+| `src/monitor.rs` | 内存 / 显存 / GPU 采样（优先 `nvidia-smi`，否则 Windows 性能计数器） |
+| `src/pdh.rs` | Windows 性能计数器（PDH）的最小封装：枚举 GPU 实例、读取计数器数值 |
 | `src/model_mgr.rs` | GGUF 扫描、导入 / 导出（预检、进度、取消、冲突）、类型判断与维度读取 |
 | `src/config.rs` | `config.json` 读写 |
 | `src/lang.rs` | 中英文文案 |
@@ -24,8 +27,10 @@
 |---|---|
 | `*.gguf` | 模型文件；程序从 exe 所在目录扫描 |
 | `llama-rag-gui.exe` | 发布副本，`start-gui.cmd` 启动它 |
-| `config.json` | 运行时配置 |
-| `logs/` | 运行日志 |
+| `config.json` | 运行时配置（原子写入） |
+| `embedding.pid` / `rerank.pid` | 运行中模型的 PID 文件（PID + 实际端口） |
+
+程序不会在模型目录下创建 `logs/` 等日志文件：运行日志只保存在内存环形队列里，由用户手动导出。
 
 
 ## 构建与检查
@@ -59,3 +64,8 @@ copy target\release\llama-rag-gui.exe ..\
 - 标识符用英文；注释用中文；用户可见文案中英双语
 - 颜色统一走 `theme::palette(dark)`；卡片与弹窗统一使用 `card_frame` / `section_title`
 - 阻塞操作（进程拉起、目录扫描等）放在后台线程，避免阻塞 UI
+- **公开项写文档注释**：每个 `pub fn` / `pub struct` / `pub enum` 至少一句说明「做什么、何时调用」；
+  内部函数在有非显然约束时（unsafe、平台差异、时序）说明原因
+- 状态栏与日志里的文案在生成时就固化成单一语言，切换语言后不会重译已显示的会话消息，
+  这是预期行为；新增文案仍需双语
+- 新增弹窗放 `src/modals/`，跨页面复用的绘制函数放 `src/ui.rs`，不要继续堆进 `main.rs`

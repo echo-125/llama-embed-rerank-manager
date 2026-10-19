@@ -63,11 +63,13 @@ fn default_true() -> bool {
     true
 }
 
+/// 配置文件的完整路径（`<模型目录>/config.json`）。
 pub fn config_path(base_dir: &Path) -> PathBuf {
     base_dir.join("config.json")
 }
 
 impl AppConfig {
+    /// 读取指定服务的端口。
     pub fn port(&self, svc_type: ServiceType) -> u16 {
         match svc_type {
             ServiceType::Embedding => self.embedding_port,
@@ -75,6 +77,7 @@ impl AppConfig {
         }
     }
 
+    /// 写入指定服务的端口（只改内存，需调用 `save` 落盘）。
     pub fn set_port(&mut self, svc_type: ServiceType, port: u16) {
         match svc_type {
             ServiceType::Embedding => self.embedding_port = port,
@@ -82,6 +85,7 @@ impl AppConfig {
         }
     }
 
+    /// 按 `ServiceType::ALL` 顺序返回两个服务的端口。
     pub fn ports(&self) -> Vec<(ServiceType, u16)> {
         ServiceType::ALL
             .iter()
@@ -89,6 +93,7 @@ impl AppConfig {
             .collect()
     }
 
+    /// 读取指定服务当前选择的模型文件名。
     pub fn model(&self, svc_type: ServiceType) -> Option<&str> {
         match svc_type {
             ServiceType::Embedding => self.embedding_model.as_deref(),
@@ -96,6 +101,7 @@ impl AppConfig {
         }
     }
 
+    /// 写入指定服务选择的模型文件名；`None` 表示未选择。
     pub fn set_model(&mut self, svc_type: ServiceType, model: Option<String>) {
         match svc_type {
             ServiceType::Embedding => self.embedding_model = model,
@@ -103,6 +109,7 @@ impl AppConfig {
         }
     }
 
+    /// 从模型目录加载配置；文件缺失或损坏时回退到默认值，端口为 0 时纠正为默认端口。
     pub fn load(base_dir: &Path) -> Self {
         let mut config = fs::read_to_string(config_path(base_dir))
             .ok()
@@ -118,6 +125,7 @@ impl AppConfig {
         config
     }
 
+    /// 原子写入配置：先写 `config.json.part` 再改名，避免崩溃留下半个文件。
     pub fn save(&self, base_dir: &Path) -> Result<(), String> {
         let text = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize config: {e}"))?;

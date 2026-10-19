@@ -6,6 +6,7 @@ use tray_icon::{
 use crate::icon;
 use crate::lang::Language;
 
+/// 系统托盘及其菜单项（菜单项句柄用于比对点击事件）。
 pub struct SystemTray {
     tray_icon: TrayIcon,
     pub item_show: MenuItem,
@@ -15,6 +16,7 @@ pub struct SystemTray {
 }
 
 impl SystemTray {
+    /// 创建托盘图标与中英文菜单。
     pub fn new(lang: Language) -> Result<Self, String> {
         let icon = create_tray_icon()?;
 
@@ -49,6 +51,7 @@ impl SystemTray {
         })
     }
 
+    /// 切换托盘菜单语言。
     pub fn set_language(&self, lang: Language) {
         self.item_show.set_text(lang.t("显示主界面", "Show window"));
         self.item_start_all
@@ -60,6 +63,7 @@ impl SystemTray {
     }
 }
 
+/// 非阻塞地取出一个托盘事件；UI 循环每帧调用。
 pub fn check_tray_events() -> Option<TrayAction> {
     if let Ok(event) = TrayIconEvent::receiver().try_recv() {
         if let TrayIconEvent::Click { button, .. } = event {
@@ -77,6 +81,7 @@ pub fn check_tray_events() -> Option<TrayAction> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+/// 托盘交互结果：切换窗口显示，或点了某个菜单项。
 pub enum TrayAction {
     ToggleShow,
     Menu(tray_icon::menu::MenuId),

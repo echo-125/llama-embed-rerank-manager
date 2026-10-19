@@ -19,6 +19,7 @@ const MAX_LOG_ITEMS: usize = 500;
 const RESTART_DELAY: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 两个受管理的检索服务；`ALL` 是服务顺序与配置持久化的唯一来源。
 pub enum ServiceType {
     Embedding,
     Rerank,
@@ -28,6 +29,7 @@ impl ServiceType {
     /// 服务面板的固定展示顺序，也是 `config.json` 的持久化顺序。
     pub const ALL: [ServiceType; 2] = [ServiceType::Embedding, ServiceType::Rerank];
 
+    /// 服务的英文名，用作日志前缀与 PID 文件名。
     pub fn name(&self) -> &'static str {
         match self {
             ServiceType::Embedding => "Embedding",
@@ -35,6 +37,7 @@ impl ServiceType {
         }
     }
 
+    /// 服务的界面显示名（双语）。
     pub fn display_name(&self, lang: Language) -> &'static str {
         match self {
             ServiceType::Embedding => lang.t("向量模型", "Embedding"),
@@ -42,6 +45,7 @@ impl ServiceType {
         }
     }
 
+    /// 默认监听端口。
     pub fn default_port(&self) -> u16 {
         match self {
             ServiceType::Embedding => 9932,
@@ -49,6 +53,7 @@ impl ServiceType {
         }
     }
 
+    /// 默认模型文件名。
     pub fn default_model(&self) -> &'static str {
         match self {
             ServiceType::Embedding => "Qwen3-Embedding-4B-Q6_K.gguf",
@@ -105,6 +110,7 @@ pub fn model_alias(model_file: &str) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 日志级别；llama-server 没有结构化级别，由关键词推断。
 pub enum LogLevel {
     Info,
     Warn,
@@ -112,13 +118,18 @@ pub enum LogLevel {
 }
 
 #[derive(Debug, Clone)]
+/// 运行日志的一条记录。
 pub struct LogItem {
+    /// 日志来源（界面显示的 `[Embedding]` / `[Rerank]` 前缀）。
     pub service: &'static str,
+    /// 来源类型：界面据此取色，不依赖显示名做字符串比较。
+    pub service_type: Option<ServiceType>,
     pub level: LogLevel,
     pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// 服务状态机：停止 / 启动中 / 运行中 / 失败。
 pub enum ServiceStatus {
     Stopped,
     Starting { pid: u32 },
@@ -126,12 +137,14 @@ pub enum ServiceStatus {
     Failed(String),
 }
 
+/// 服务的持久化配置（端口与模型文件）。
 pub struct ServiceConfig {
     pub service_type: ServiceType,
     pub port: u16,
     pub model_file: String,
 }
 
+/// 服务运行期状态：配置、当前状态、子进程句柄与待生效端口。
 pub struct ServiceInstance {
     pub config: ServiceConfig,
     pub status: ServiceStatus,
@@ -140,6 +153,7 @@ pub struct ServiceInstance {
     pub pending_port: Option<u16>,
 }
 
+/// 两个服务的总控：拉起 / 停止 / 健康检查 / 日志队列 / 延迟重启。
 pub struct ServiceManager {
     base_dir: PathBuf,
     llama_exe: Option<PathBuf>,
@@ -152,11 +166,13 @@ pub struct ServiceManager {
     pending_restarts: Vec<(usize, Instant)>,
 }
 
+/// 服务的 PID 文件路径（`<模型目录>/<service>.pid`）。
 pub fn service_pid_file(base_dir: &Path, svc_type: ServiceType) -> PathBuf {
     base_dir.join(format!("{}.pid", svc_type.name().to_lowercase()))
 }
 
 impl ServiceManager {
+    /// 创建管理器并按 PID 文件收养上次运行残留的进程。
     pub fn new<P: AsRef<Path>>(base_dir: P, llama_exe: Option<PathBuf>, lang: Language) -> Self {
         let base_dir = base_dir.as_ref().to_path_buf();
 
@@ -189,14 +205,17 @@ impl ServiceManager {
         mgr
     }
 
+    /// 切换界面语言（影响状态文案与日志文案）。
     pub fn set_language(&mut self, lang: Language) {
         self.lang = lang;
     }
 
+    /// 当前使用的 llama 运行时路径。
     pub fn get_llama_path(&self) -> Option<&Path> {
         self.llama_exe.as_deref()
     }
 
+    /// 设置 llama 运行时路径，并清除「找不到 llama.exe」的失败状态。
     pub fn set_llama_exe(&mut self, path: PathBuf) {
         self.llama_exe = Some(path);
         for svc in &mut self.services {
@@ -232,12 +251,14 @@ impl ServiceManager {
         }
     }
 
+    /// 是否有运行中服务保存了待生效端口。
     pub fn has_pending_port_changes(&self) -> bool {
         self.services.iter().any(|svc| svc.pending_port.is_some())
     }
 
+    /// 追加一条应用级日志（服务类型为 None，界面用中性色显示）。
     pub fn append_log(&self, service: &'static str, level: LogLevel, text: String) {
-        push_log(&self.logs, service, level, text);
+        push_log(&self.logs, service, None, level, text);
     }
 
     /// 读取 PID 文件并确认对应进程仍在运行。
@@ -279,6 +300,7 @@ impl ServiceManager {
             .unwrap_or(false)
     }
 
+    /// 与真实进程对齐状态：收割子进程、按 PID 文件收养、做健康检查。UI 每 2 秒调用一次。
     pub fn sync_with_existing_processes(&mut self) {
         let base_dir = self.base_dir.clone();
         for idx in 0..self.services.len() {
@@ -379,6 +401,7 @@ impl ServiceManager {
         }
     }
 
+    /// 拉起指定服务的 llama-server；参数有误或端口占用时直接把服务置为 Failed。
     pub fn start_service(&mut self, idx: usize) -> Result<(), String> {
         if idx >= self.services.len() {
             return Err(self
@@ -462,10 +485,10 @@ impl ServiceManager {
             return Err(err);
         }
 
-        let log_dir = self.base_dir.join("logs");
-        let _ = fs::create_dir_all(&log_dir);
+        // 运行日志只保存在内存环形队列里（见 `logs` 字段），不再在模型目录下创建
+        // 从不会写入的 logs/ 目录：少一个磁盘产物，也更符合「轻量」的定位。
 
-        // 核心修复：llama.exe 属于子命令模式，必须传递 'serve' 作为第一个参数
+        // llama.exe 属于子命令模式，必须传递 'serve' 作为第一个参数
         let mut args: Vec<String> = vec![
             "serve".to_string(),
             "-m".to_string(),
@@ -506,12 +529,11 @@ impl ServiceManager {
         let _ = fs::write(&pid_file, format!("{pid}\n{port}"));
 
         let logs = self.logs.clone();
-        let svc_name = svc_type.name();
         if let Some(stdout) = child.stdout.take() {
-            spawn_log_pump(logs.clone(), svc_name, stdout);
+            spawn_log_pump(logs.clone(), svc_type, stdout);
         }
         if let Some(stderr) = child.stderr.take() {
-            spawn_log_pump(logs, svc_name, stderr);
+            spawn_log_pump(logs, svc_type, stderr);
         }
 
         self.services[idx].child = Some(child);
@@ -541,6 +563,7 @@ impl ServiceManager {
         Ok(())
     }
 
+    /// 停止指定服务：结束子进程、清理 PID 文件、应用待生效端口。
     pub fn stop_service(&mut self, idx: usize) {
         if idx >= self.services.len() {
             return;
@@ -636,6 +659,7 @@ impl ServiceManager {
         }
     }
 
+    /// 停止全部服务并取消未决重启。
     pub fn stop_all(&mut self) {
         self.pending_restarts.clear();
         for i in 0..self.services.len() {
@@ -655,12 +679,14 @@ impl ServiceManager {
         }
     }
 
+    /// 登记全部服务重启（真正的启动由 `process_pending_restarts` 到点执行）。
     pub fn restart_all(&mut self) {
         for i in 0..self.services.len() {
             let _ = self.restart_service(i);
         }
     }
 
+    /// 同步调用 `/health` 做一次即时连通性测试，供界面「测试」按钮使用。
     pub fn test_service(&self, idx: usize) -> Result<String, String> {
         if idx >= self.services.len() {
             return Err(self.lang.t("无效的模型", "Invalid model").to_string());
@@ -698,6 +724,7 @@ impl ServiceManager {
         })
     }
 
+    /// 读取运行中（或启动中）服务的 PID。
     pub fn get_service_pid(&self, svc_type: ServiceType) -> Option<u32> {
         for s in &self.services {
             if s.config.service_type == svc_type {
@@ -712,9 +739,12 @@ impl ServiceManager {
 }
 
 /// 向日志队列追加一条记录；队列有界，超出容量时丢弃最旧的一条。
+///
+/// `service_type` 为 None 表示应用级日志（例如启动清理临时文件），界面用中性色显示。
 fn push_log(
     logs: &Arc<Mutex<VecDeque<LogItem>>>,
     service: &'static str,
+    service_type: Option<ServiceType>,
     level: LogLevel,
     text: String,
 ) {
@@ -724,6 +754,7 @@ fn push_log(
         }
         l.push_back(LogItem {
             service,
+            service_type,
             level,
             text,
         });
@@ -745,9 +776,10 @@ fn classify_log_level(line: &str) -> LogLevel {
 /// 启动一条输出管道（stdout/stderr）的日志泵线程：逐行读取直至管道关闭。
 fn spawn_log_pump<R: std::io::Read + Send + 'static>(
     logs: Arc<Mutex<VecDeque<LogItem>>>,
-    service: &'static str,
+    service_type: ServiceType,
     pipe: R,
 ) {
+    let service = service_type.name();
     std::thread::spawn(move || {
         let reader = BufReader::new(pipe);
         for line in reader.lines() {
@@ -758,6 +790,7 @@ fn spawn_log_pump<R: std::io::Read + Send + 'static>(
                     push_log(
                         &logs,
                         service,
+                        Some(service_type),
                         LogLevel::Warn,
                         "<non-utf8 output>".to_string(),
                     );
@@ -767,11 +800,12 @@ fn spawn_log_pump<R: std::io::Read + Send + 'static>(
                 Err(_) => break,
             };
             let level = classify_log_level(&text);
-            push_log(&logs, service, level, text);
+            push_log(&logs, service, Some(service_type), level, text);
         }
     });
 }
 
+/// 探测 `http://127.0.0.1:<port>/health` 是否返回 ok。
 pub fn test_health(port: u16) -> bool {
     let url = format!("http://127.0.0.1:{}/health", port);
     let agent = ureq::Agent::config_builder()
@@ -794,6 +828,7 @@ fn kill_pid(pid: u32) {
         .output();
 }
 
+/// 自动定位 `llama.exe`：先查 Llama 桌面端默认安装位置，再退回 `where.exe`。
 pub fn find_llama_exe() -> Option<PathBuf> {
     if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
         let p = PathBuf::from(appdata)

@@ -38,6 +38,7 @@ pub struct Palette {
     pub selection_bg: Color32,
 }
 
+/// 取出明 / 暗两套配色中的一套；所有界面颜色都必须来自这里。
 pub fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
@@ -100,6 +101,7 @@ pub fn palette(dark: bool) -> Palette {
     }
 }
 
+/// 把配色应用到 egui 上下文，并统一控件间距与高度基准。
 pub fn apply_theme(ctx: &egui::Context, dark: bool) {
     let p = palette(dark);
     let mut visuals = if dark {

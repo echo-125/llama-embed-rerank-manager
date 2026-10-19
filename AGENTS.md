@@ -33,16 +33,20 @@ llama.cpp（`llama-server`）的两个检索服务 —— 文本向量化（默�
 
 ## Project layout
 
-仓库只包含源码、文档与资源；模型、发布 exe、`config.json`、`logs/` 都在仓库根之外（本目录的**上一级**
-`E:\LlamaModels`），由程序按 exe 所在目录扫描，不要提交进仓库。
+仓库只包含源码、文档与资源；模型、发布 exe、`config.json` 与 PID 文件都在仓库根之外，由程序按
+exe 所在目录扫描，不要提交进仓库。仓库**不含任何本机固定路径**：模型目录在运行时解析（见
+`resolve_base_dir`），不要写死盘符或用户名。
 
-- `src/main.rs` — eframe 应用：模型运行 / 模型文件 / 运行日志 / 设置，托盘事件，明暗与中英文切换，弹窗
+- `src/main.rs` — 应用状态、四个页签（模型运行 / 模型文件 / 运行日志 / 设置）、托盘事件、启动入口
+- `src/modals/` — 弹窗：移除确认、同名冲突、自动分配确认、接口详情
+- `src/ui.rs` — 跨页面复用的绘制小部件与纯函数（表格单元、状态色、文件名校验、短名截断）
 - `src/service.rs` — `ServiceType` / `ServiceConfig` / `ServiceManager`：向量与重排服务的拉起、健康检查、
-  PID 文件、端口草稿与待生效端口、日志跟随
-- `src/monitor.rs` — sysinfo 采样内存 / 显存 / GPU 利用率
-- `src/model_mgr.rs` — 扫描 / 导入 GGUF；按文件名判断 Embedding / Rerank / Other
-- `src/config.rs` — `AppConfig`：两个端口、两个模型、`ignored_models`、`llama_exe_path`、
-  `dark_mode`、`language`，读写 `config.json`
+  PID 文件、端口草稿与待生效端口、内存日志队列
+- `src/monitor.rs` — sysinfo 采样内存，GPU 走 `nvidia-smi` 或 PDH 兜底
+- `src/pdh.rs` — Windows 性能计数器（PDH）封装：枚举 GPU 实例、逐实例读数值
+- `src/model_mgr.rs` — 扫描 / 导入 / 导出 GGUF；元数据 + 文件名判断 Embedding / Rerank / Other
+- `src/config.rs` — `AppConfig`：两个端口、两个模型、`ignored_models`、`auto_assign_imported`、
+  `model_kinds`、`llama_exe_path`、`dark_mode`、`language`，读写 `config.json`
 - `src/lang.rs` — `Language::{Zh, En}` 与翻译辅助
 - `src/icon.rs` — 内嵌 llama.app 图标的 RGBA 资源
 - `src/tray.rs` — 系统托盘与中英文菜单
@@ -51,7 +55,7 @@ llama.cpp（`llama-server`）的两个检索服务 —— 文本向量化（默�
 - `assets/` — 图标源文件与构建资源：`llama-logo.svg`、`llama.ico`、`logo_32.rgba`、`logo_128.rgba`、`screenshot.png`
 - `build.rs` — 嵌入 Windows exe 图标
 - `start-gui.cmd` — 双击启动 GUI
-- `logs/`、`config.json`、`*.gguf`、发布副本 `llama-rag-gui.exe` — 位于上一级目录，不在本仓库内
+- `config.json`、`*.gguf`、`*.pid`、发布副本 `llama-rag-gui.exe` — 位于模型目录（exe 同级），不在本仓库内
 - `.ref-m3u8/` — 外部 UI 参考代码，不参与构建，不要提交
 
 ## Architecture notes
@@ -72,9 +76,14 @@ llama.cpp（`llama-server`）的两个检索服务 —— 文本向量化（默�
   收养进程时按文件里的端口做健康检查，因此不能只写 PID。
 - **启动命令日志**：`start_service` 会把完整 llama-server 命令行写入运行日志，既是复现依据，也是与
   排查推理参数问题与复现故障的第一手材料。
+- **日志只在内存里**：`ServiceManager::logs` 是 500 条环形队列，不落盘、不建 `logs/` 目录；
+  用户在「运行日志」页手动导出。新增运行期文件前先确认是否必要（轻量定位优先）
+- **GPU 采样回退**：`monitor.rs` 先试 `nvidia-smi`，失败再走 `pdh.rs` 的 Windows 性能计数器。
+  PDH 通配路径 `(*)` 在本进程拿不到实例，必须用 `enumerate_instances` 枚举后再查精确路径。
 - **延迟重启**：`restart_service` 只停止并登记 300ms 延迟，真正的启动由 UI 循环调用
   `process_pending_restarts` 到点执行；不在 UI 线程上 sleep。手动 stop/start 会取消未决重启。
-- 基目录在运行时解析：当前工作目录 → 可执行文件同级目录 → `E:\LlamaModels`（见 `resolve_base_dir`）。
+- **基目录在运行时解析**：工作目录含 GGUF 时用工作目录，否则用 exe 同级目录（见 `resolve_base_dir`）。
+  不可以使用本机固定路径作为兜底。
 - 仅支持 Windows：使用 `std::os::windows::process::CommandExt` 与 `CREATE_NO_WINDOW` 隐藏子进程窗口，
   其他平台构建失败是预期行为，不要为跨平台做改造。
 - `llama.exe` 是子命令模式，启动时第一个参数必须传 `serve`。
@@ -92,11 +101,16 @@ llama.cpp（`llama-server`）的两个检索服务 —— 文本向量化（默�
   结果回写互斥量，不要阻塞 UI 刷新
 - 颜色使用 `theme::Palette`；不要直接写 `Color32::from_rgb` 的界面颜色
 - 弹窗和卡片使用 `card_frame(dark)` / `section_title`，保持间距、圆角和字号一致
+- **公开项写文档注释**：`pub fn` / `pub struct` / `pub enum` 至少一句「做什么、何时调用」；
+  涉及 unsafe / 平台差异 / 时序约束的内部函数必须写明原因
+- 新增弹窗放 `src/modals/`，跨页面复用的绘制函数放 `src/ui.rs`；不再往 `main.rs` 堆新页面
+- 状态栏与日志文案在生成时固化为单一语言，切换语言后不重译历史消息（预期行为）
 
 ## Testing instructions
 
 - `cargo test`：`src/config.rs`（配置读写、字段默认值）、`src/model_mgr.rs`（模型类型判断、导入复制）、
-  `src/service.rs`（模型别名、日志分级、延迟重启调度、PID 文件解析）与 `src/icon.rs`（图标资源字节数）。
+  `src/service.rs`（模型别名、日志分级、延迟重启调度、PID 文件解析）、`src/pdh.rs`（实例名解析、LUID 归并
+  与实机枚举校验）与 `src/icon.rs`（图标资源字节数）。
 - 新增测试放在对应模块的 `#[cfg(test)] mod tests`。
 - 手工验证见 README 的「快速验证」：两个服务分别 `/health`，再调用 `/v1/embeddings` 与 `/v1/rerank`。
 - 涉及端口、模型切换、服务参数、主题/语言切换的改动，必须实际启停一次服务并逐项验证。
@@ -105,8 +119,8 @@ llama.cpp（`llama-server`）的两个检索服务 —— 文本向量化（默�
 ## PR & commit conventions
 
 - 从 `master` 分支开发；提交信息用 conventional commits（`feat:` / `fix:` / `docs:` / `refactor:`）
-- `.gitignore` 已忽略 `/target`、`*.part`、`/.ref-m3u8/`；模型、`config.json`、`logs/`、PID 与发布 exe 都在
-  仓库外（上一级目录），本来就不入库。
+- `.gitignore` 已忽略 `/target`、`*.part`、`/.ref-m3u8/`；模型、`config.json`、PID 与发布 exe 都在
+  仓库外（模型目录），本来就不入库。
   即便如此仍请显式 `git add <file>`，不要 `git add -A`
 - 新增运行期产物（pid / log / part 文件）时，先补 `.gitignore` 再提交
 

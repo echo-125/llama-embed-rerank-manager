@@ -30,6 +30,7 @@ pub enum ModelKind {
 }
 
 impl ModelKind {
+    /// 按文件名启发式判断模型类型（识别链的最后一级）。
     pub fn classify(file_name: &str) -> Self {
         let lower = file_name.to_lowercase();
         if lower.contains("rerank") {
@@ -70,6 +71,7 @@ impl ModelKind {
         self.service_type() == Some(service)
     }
 
+    /// 类型的界面显示名。
     pub fn label(self, lang: Language) -> &'static str {
         match self {
             Self::Embedding => "Embedding",
@@ -116,10 +118,12 @@ impl CopyDirection {
 }
 
 impl CopyJob {
+    /// 已复制的字节数（UI 进度行使用）。
     pub fn copied_bytes(&self) -> u64 {
         self.copied_bytes.load(Ordering::Relaxed)
     }
 
+    /// 源文件总字节数。
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes
     }
@@ -148,11 +152,9 @@ impl CopyJob {
     }
 }
 
-/// 兼容旧名的类型别名：导入侧继续用 `ImportJob` 表达。
-pub type ImportJob = CopyJob;
-
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
+/// 模型目录中的一个 GGUF 文件及其识别结果。
 pub struct ModelFile {
     pub file_name: String,
     pub path: PathBuf,
@@ -164,6 +166,7 @@ pub struct ModelFile {
     pub embedding_dim: Option<u32>,
 }
 
+/// 模型目录的扫描器：维护文件名到向量维度的缓存，避免每次刷新都解析文件头。
 pub struct ModelManager {
     base_dir: PathBuf,
     dim_cache: RefCell<DimCache>,
@@ -172,6 +175,7 @@ pub struct ModelManager {
 type DimCache = HashMap<String, (u64, Option<u64>, Option<u32>)>;
 
 impl ModelManager {
+    /// 绑定模型目录创建扫描器。
     pub fn new<P: AsRef<Path>>(base_dir: P) -> Self {
         Self {
             base_dir: base_dir.as_ref().to_path_buf(),
@@ -262,7 +266,7 @@ impl ModelManager {
     pub fn import_model_dialog(
         &self,
         lang: Language,
-    ) -> Result<Option<(ImportJob, Option<ImportConflict>)>, String> {
+    ) -> Result<Option<(CopyJob, Option<ImportConflict>)>, String> {
         let picked = rfd::FileDialog::new()
             .set_title(lang.t(
                 "选择要导入的 GGUF 模型文件",
@@ -290,7 +294,8 @@ impl ModelManager {
         self.begin_import(&source_path, &file_name, lang)
     }
 
-    /// 对指定源文件启动导入（文件对话框之外的入口，供拖拽导入复用）。
+    /// 对指定源文件启动导入（内部入口：文件对话框选中后由
+    /// `import_model_dialog` 调用，不提供拖拽等其他触发方式）。
     ///
     /// 同样做完整的预检；目标已有同名文件时返回冲突信息等待用户决定。
     pub fn begin_import(
@@ -298,7 +303,7 @@ impl ModelManager {
         source_path: &Path,
         file_name: &str,
         lang: Language,
-    ) -> Result<Option<(ImportJob, Option<ImportConflict>)>, String> {
+    ) -> Result<Option<(CopyJob, Option<ImportConflict>)>, String> {
         let zh = lang.is_zh();
         let dest_path = self.base_dir.join(file_name);
 
@@ -345,7 +350,7 @@ impl ModelManager {
         &self,
         model_name: &str,
         lang: Language,
-    ) -> Result<Option<(ImportJob, Option<ImportConflict>)>, String> {
+    ) -> Result<Option<(CopyJob, Option<ImportConflict>)>, String> {
         let zh = lang.is_zh();
         let default_name = if model_name.to_lowercase().ends_with(".gguf") {
             model_name.to_string()
@@ -852,6 +857,7 @@ fn gguf_scalar_size(type_id: u32) -> Option<u64> {
     }
 }
 
+/// 把字节数格式化为 `1.23 GB` 这类可读文本。
 pub fn format_file_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
