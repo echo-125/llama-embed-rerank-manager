@@ -38,14 +38,14 @@ exe 所在目录扫描，不要提交进仓库。仓库**不含任何本机固�
 `resolve_base_dir`），不要写死盘符或用户名。
 
 - `src/main.rs` — 应用状态、四个页签（模型运行 / 模型文件 / 运行日志 / 设置）、托盘事件、启动入口
-- `src/modals/` — 弹窗：移除确认、同名冲突、自动分配确认、接口详情
+- `src/modals/` — 弹窗：同名冲突、自动分配确认、接口详情
 - `src/ui.rs` — 跨页面复用的绘制小部件与纯函数（表格单元、状态色、文件名校验、短名截断）
 - `src/service.rs` — `ServiceType` / `ServiceConfig` / `ServiceManager`：向量与重排服务的拉起、健康检查、
   PID 文件、端口草稿与待生效端口、内存日志队列
 - `src/monitor.rs` — sysinfo 采样内存，GPU 走 `nvidia-smi` 或 PDH 兜底
 - `src/pdh.rs` — Windows 性能计数器（PDH）封装：枚举 GPU 实例、逐实例读数值
 - `src/model_mgr.rs` — 扫描 / 导入 / 导出 GGUF；元数据 + 文件名判断 Embedding / Rerank / Other
-- `src/config.rs` — `AppConfig`：两个端口、两个模型、`ignored_models`、`auto_assign_imported`、
+- `src/config.rs` — `AppConfig`：两个端口、两个模型、`model_dir`、`auto_assign_imported`、
   `model_kinds`、`llama_exe_path`、`dark_mode`、`language`，读写 `config.json`
 - `src/lang.rs` — `Language::{Zh, En}` 与翻译辅助
 - `src/icon.rs` — 内嵌 llama.app 图标的 RGBA 资源
@@ -68,8 +68,10 @@ exe 所在目录扫描，不要提交进仓库。仓库**不含任何本机固�
   `pending_port`，重启/停止后生效。启动/重启前会先应用草稿；两个端口必须互不相同。
 - **模型选择**：模型行的下拉只显示与当前服务同类型的模型（由 `ModelKind::fits_service` 判断），选择会立即
   写入 `config.json`；启动前仍会校验文件存在。导入完成后会自动把模型分配给对应类型。
-- **移除导入不是删除**：模型文件页的「移除」只把文件名写入 `ignored_models` 并从列表隐藏，磁盘文件保留；
-  若该模型被停止中的服务选中会同时清空选择。页面提供「恢复已移除」入口。
+- **模型文件页只读**：不提供删除 / 隐藏模型的功能，只有导入与导出；磁盘文件由用户用资源管理器管理。
+  不要重新引入「移除导入」这类状态，它会让配置与磁盘状态不一致。
+- **模型目录可配置**：`config.json` 的 `model_dir` 优先，缺失或目录不存在时回退到 `resolve_base_dir`。
+  切换目录走 `switch_model_dir`（重建 `ModelManager`、刷新列表、立即落盘），不要直接改 `base_dir`。
 - **接入模型名**：启动时传 `--alias`，值为所选模型文件名去掉 `.gguf`；API 弹窗展示同一名称。改规则要同步
   `model_alias` 与 `start_service` 的参数。
 - **PID 文件格式**：`{service}.pid` 为两行，第一行 PID，第二行启动时实际使用的端口。重启 GUI 后通过 PID 文件

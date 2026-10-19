@@ -6,4 +6,3 @@
 mod api_modal;
 mod assign_modal;
 mod conflict_modal;
-mod delete_modal;

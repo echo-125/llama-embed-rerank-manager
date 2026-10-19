@@ -17,15 +17,15 @@ pub struct AppConfig {
     pub embedding_model: Option<String>,
     #[serde(default)]
     pub rerank_model: Option<String>,
-    /// 已从模型文件页移除、但保留在磁盘上的模型文件名。
-    #[serde(default)]
-    pub ignored_models: Vec<String>,
     /// 导入完成后是否按模型类型自动分配给对应服务（默认开启）。
     #[serde(default = "default_true")]
     pub auto_assign_imported: bool,
     /// 用户手动修正的模型类型（文件名 -> 类型），优先于自动识别。
     #[serde(default)]
     pub model_kinds: std::collections::HashMap<String, crate::model_mgr::ModelKind>,
+    /// 自定义模型目录；`None` 表示使用 exe 所在目录。
+    #[serde(default)]
+    pub model_dir: Option<String>,
     #[serde(default)]
     pub llama_exe_path: Option<String>,
     #[serde(default)]
@@ -41,9 +41,9 @@ impl Default for AppConfig {
             rerank_port: default_rerank_port(),
             embedding_model: None,
             rerank_model: None,
-            ignored_models: Vec::new(),
             auto_assign_imported: true,
             model_kinds: std::collections::HashMap::new(),
+            model_dir: None,
             llama_exe_path: None,
             dark_mode: false,
             language: Language::Zh,
@@ -159,7 +159,6 @@ mod tests {
         let config = AppConfig {
             embedding_port: 10032,
             rerank_port: 10033,
-            ignored_models: vec!["removed.gguf".to_string()],
             llama_exe_path: Some(r"C:\tools\llama.exe".to_string()),
             dark_mode: true,
             language: Language::En,
@@ -172,7 +171,6 @@ mod tests {
         let loaded = AppConfig::load(&dir);
         assert_eq!(loaded.embedding_port, 10032);
         assert_eq!(loaded.rerank_port, 10033);
-        assert_eq!(loaded.ignored_models, vec!["removed.gguf".to_string()]);
         assert_eq!(
             loaded.llama_exe_path.as_deref(),
             Some(r"C:\tools\llama.exe")
@@ -187,7 +185,6 @@ mod tests {
         assert!(partial.llama_exe_path.is_none());
         assert!(!partial.dark_mode);
         assert_eq!(partial.language, Language::Zh);
-        assert!(partial.ignored_models.is_empty());
         assert!(partial.auto_assign_imported);
         assert!(partial.model_kinds.is_empty());
 

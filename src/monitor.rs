@@ -9,8 +9,8 @@ use crate::pdh::{self, PdhQuery};
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-#[derive(Clone, Debug, Default)]
 /// 一次采样的资源数据快照，供 UI 读取。
+#[derive(Clone, Debug, Default)]
 pub struct SystemStats {
     pub ram_total_mb: u64,
     pub ram_used_mb: u64,
@@ -28,11 +28,45 @@ pub struct SystemStats {
     pub gpu_available: bool,
     /// 显存总量是否可信：走性能计数器兜底时只有型号已知才估得出总量。
     pub vram_total_known: bool,
+    /// 本次 GPU 数据的来源：`NVIDIA`（nvidia-smi）或 `PDH`（Windows 性能计数器）。
+    pub gpu_source: Option<GpuSource>,
+}
+
+/// GPU 数据来源，设置页据此说明采样方式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GpuSource {
+    #[default]
+    NvidiaSmi,
+    PerformanceCounters,
+}
+
+impl GpuSource {
+    /// 来源的界面文案。
+    pub fn label(self, lang: crate::lang::Language) -> &'static str {
+        match self {
+            Self::NvidiaSmi => "nvidia-smi",
+            Self::PerformanceCounters => {
+                lang.t("Windows 性能计数器", "Windows performance counters")
+            }
+        }
+    }
+}
+
+impl SystemStats {
+    /// 显存总量文本（`8.00 GB`）；总量未知时返回空串。
+    pub fn gpu_total_text(&self) -> String {
+        if self.vram_total_known && self.vram_total_mb > 0 {
+            format!("{:.2} GB", self.vram_total_mb as f32 / 1024.0)
+        } else {
+            String::new()
+        }
+    }
 }
 
 /// 一次 GPU 采样的结果，由后台线程回写。
 #[derive(Default)]
 struct GpuSample {
+    source: GpuSource,
     name: String,
     total_mb: u64,
     used_mb: u64,
@@ -70,6 +104,31 @@ impl Monitor {
             .lock()
             .map(|stats| stats.clone())
             .unwrap_or_default()
+    }
+
+    /// 当前显卡数据的采样方式；还没采到数据时返回「未知」。
+    pub fn gpu_source(&self, lang: crate::lang::Language) -> String {
+        self.stats
+            .lock()
+            .ok()
+            .and_then(|stats| stats.gpu_source)
+            .map(|source| source.label(lang).to_string())
+            .unwrap_or_else(|| lang.t("未知", "Unknown").to_string())
+    }
+
+    /// 丢弃缓存的显卡数据并立即重新采样（设置页「重新检测」使用）。
+    ///
+    /// 显卡型号查询结果也会失效，否则换了外接显卡后型号仍是旧的。
+    pub fn reset_gpu(&mut self) {
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.gpu_available = false;
+            stats.gpu_name.clear();
+            stats.gpu_source = None;
+        }
+        if let Ok(mut cache) = gpu_adapter_name_cache().lock() {
+            *cache = None;
+        }
+        self.last_update = Instant::now() - Duration::from_secs(10);
     }
 
     /// 距上次采样超过 `interval` 时刷新一次内存 / 进程 / GPU 数据。
@@ -146,6 +205,7 @@ impl Monitor {
                     stats.gpu_util_percent = gpu.util_percent;
                     stats.gpu_available = true;
                     stats.vram_total_known = gpu.total_known;
+                    stats.gpu_source = Some(gpu.source);
                 }
                 sampling.store(false, Ordering::Relaxed);
             });
@@ -184,6 +244,7 @@ fn query_nvidia_smi() -> Option<GpuSample> {
     }
 
     Some(GpuSample {
+        source: GpuSource::NvidiaSmi,
         name: parts[0].to_string(),
         total_mb: parts[1].parse().unwrap_or(0),
         used_mb: parts[2].parse().unwrap_or(0),
@@ -296,6 +357,7 @@ fn query_pdh() -> Option<GpuSample> {
     let total_mb = fallback_vram_total_mb(&name).unwrap_or(0);
 
     Some(GpuSample {
+        source: GpuSource::PerformanceCounters,
         name,
         total_mb,
         used_mb,
@@ -306,28 +368,43 @@ fn query_pdh() -> Option<GpuSample> {
 }
 
 /// 通过 `Win32_VideoController` 读取显卡型号；只查询一次并缓存。
+fn gpu_adapter_name_cache() -> &'static Mutex<Option<Option<String>>> {
+    static CACHED: std::sync::OnceLock<Mutex<Option<Option<String>>>> = std::sync::OnceLock::new();
+    CACHED.get_or_init(|| Mutex::new(None))
+}
+
 fn gpu_adapter_name() -> Option<String> {
-    static CACHED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    CACHED
-        .get_or_init(|| {
-            let output = Command::new("powershell")
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    "(Get-CimInstance Win32_VideoController).Name -join '|'",
-                ])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output()
-                .ok()?;
-            let text = String::from_utf8_lossy(&output.stdout);
-            // 多卡时取第一个非空型号名
-            text.split('|')
-                .map(str::trim)
-                .find(|name| !name.is_empty())
-                .map(str::to_string)
-        })
-        .clone()
+    let cache = gpu_adapter_name_cache();
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.as_ref()
+    {
+        return cached.clone();
+    }
+    let fetched = query_adapter_name();
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(fetched.clone());
+    }
+    fetched
+}
+
+/// 通过 `Win32_VideoController` 查询显卡型号（不做缓存）。
+fn query_adapter_name() -> Option<String> {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-CimInstance Win32_VideoController).Name -join '|'",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    // 多卡时取第一个非空型号名
+    text.split('|')
+        .map(str::trim)
+        .find(|name| !name.is_empty())
+        .map(str::to_string)
 }
 
 #[cfg(test)]

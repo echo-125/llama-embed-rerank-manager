@@ -36,6 +36,8 @@ use ui::{
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const HF_GGUF_URL: &str = "https://huggingface.co/models?library=gguf";
+/// Llama 桌面端下载页（设置页「下载 Llama」按钮跳转）。
+const LLAMA_SITE_URL: &str = "https://llama.app/";
 
 /// 自动分配确认弹窗的数据：新导入的模型将替换对应服务当前的选择。
 #[derive(Clone)]
@@ -87,7 +89,6 @@ struct RagGuiApp {
     search_query: String,
     active_tab: usize,
     status_message: Option<(String, Instant, bool)>, // (msg, time, is_error)
-    delete_confirm_file: Option<String>,
     api_modal_svc: Option<ServiceType>,
     /// 正在后台复制中的模型导入 / 导出任务（同一时间只允许一个）。
     import_job: Option<CopyJob>,
@@ -99,8 +100,6 @@ struct RagGuiApp {
     assign_confirm: Option<AssignConfirm>,
     /// 复制线程仍在运行但已请求取消：等待线程收尾再清任务。
     cancel_requested: bool,
-    /// 模型文件页是否展开「已移除」列表（逐个恢复）。
-    show_removed: bool,
 
     // Log filters & state
     show_info: bool,
@@ -150,11 +149,36 @@ fn resolve_base_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// 默认模型目录：exe 所在目录。
+///
+/// 与 `resolve_base_dir` 的区别：后者还会优先考虑当前工作目录里的 GGUF，
+/// 这里只用于「恢复默认」——回到 exe 同级，与发布形态一致。
+fn default_model_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// 解析最终生效的模型目录。
+///
+/// `fallback` 是自动解析出的目录；配置里的 `model_dir` 优先，但目录不存在
+/// （盘符变更、被删除）时回退，避免指向一个空目录导致列表永远为空。
+fn resolve_dirs(fallback: PathBuf, configured: Option<&str>) -> PathBuf {
+    configured
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_dir())
+        .unwrap_or(fallback)
+}
 impl RagGuiApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_fonts(&cc.egui_ctx);
 
-        let base_dir = resolve_base_dir();
+        // 配置里的自定义模型目录优先；目录不存在（盘符变更、被删除）时回退到自动解析。
+        let resolved_dir = resolve_base_dir();
+        let peeked = AppConfig::load(&resolved_dir);
+        let base_dir = resolve_dirs(resolved_dir, peeked.model_dir.as_deref());
         // 启动时清理上次复制被中断留下的 `*.gguf.part` 残留（此时不可能有进行中的任务）。
         let cleaned_parts = cleanup_part_files(&base_dir);
         let config = AppConfig::load(&base_dir);
@@ -219,14 +243,12 @@ impl RagGuiApp {
             search_query: String::new(),
             active_tab: 0,
             status_message: None,
-            delete_confirm_file: None,
             api_modal_svc: None,
             import_job: None,
             import_conflict: None,
             conflict_save_as: String::new(),
             assign_confirm: None,
             cancel_requested: false,
-            show_removed: false,
             show_info: true,
             show_warn: true,
             show_error: true,
@@ -246,44 +268,20 @@ impl RagGuiApp {
         self.status_message = Some((msg.into(), Instant::now(), is_error));
     }
 
+    /// 重新扫描模型目录并刷新列表（导入 / 导出 / 切换目录后调用）。
     fn refresh_models(&mut self) {
-        let ignored = self.config.ignored_models.clone();
-        self.models = self
-            .model_mgr
-            .scan_models(&self.config.model_kinds.clone())
-            .into_iter()
-            .filter(|model| {
-                !ignored
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case(&model.file_name))
-            })
-            .collect();
+        self.models = self.model_mgr.scan_models(&self.config.model_kinds.clone());
     }
 
-    /// 导入完成后的收尾：清理 ignored 记录、刷新列表、按策略自动分配并落盘。
+    /// 导入完成后的收尾：刷新列表、按策略自动分配对应服务并落盘。
     ///
     /// 若目标服务已有不同的模型且总开关开启，则转入确认弹窗而不是静默覆盖。
     fn finish_import(&mut self, file_name: &str) {
         let lang = self.lang();
-        // P0-1：重新导入曾「移除」的同名模型时，把该名字从 ignored_models 里清掉，
-        // 否则新导入的文件会被 refresh_models 继续隐藏。
-        let was_ignored = self
-            .config
-            .ignored_models
-            .iter()
-            .any(|n| n.eq_ignore_ascii_case(file_name));
-        if was_ignored {
-            self.config
-                .ignored_models
-                .retain(|n| !n.eq_ignore_ascii_case(file_name));
-        }
         self.refresh_models();
 
         if !self.config.auto_assign_imported {
             // 总开关关闭：只导入不分配。
-            if was_ignored {
-                self.save_config();
-            }
             self.set_status(
                 if lang.is_zh() {
                     format!("成功导入 {file_name}")
@@ -326,9 +324,6 @@ impl RagGuiApp {
             }
             // 未识别为向量 / 重排模型，或目标服务已选择同一模型。
             None => {
-                if was_ignored {
-                    self.save_config();
-                }
                 let recognized = self
                     .models
                     .iter()
@@ -462,6 +457,48 @@ impl RagGuiApp {
             return self.save_config();
         }
         true
+    }
+
+    /// 切换模型目录（None 表示回到 exe 所在目录），并重建扫描器与配置路径。
+    ///
+    /// 切换后模型列表基于新目录重新加载并立即持久化；正在运行的服务不会被打断，
+    /// 但它们的模型文件仍来自旧目录，所以提示用户重启。
+    fn switch_model_dir(&mut self, dir: Option<PathBuf>) {
+        let lang = self.lang();
+        let new_dir = match &dir {
+            Some(path) => path.clone(),
+            None => default_model_dir(),
+        };
+        if !new_dir.is_dir() {
+            self.set_status(
+                if lang.is_zh() {
+                    format!("模型目录不可用: {}", new_dir.display())
+                } else {
+                    format!("Model folder is not available: {}", new_dir.display())
+                },
+                true,
+            );
+            return;
+        }
+        self.config.model_dir = dir.map(|path| path.to_string_lossy().to_string());
+        self.base_dir = new_dir.clone();
+        self.model_mgr = ModelManager::new(&new_dir);
+        self.refresh_models();
+        self.save_config();
+        self.set_status(
+            if lang.is_zh() {
+                format!(
+                    "模型目录已切换到 {}，请重新选择模型并重启服务",
+                    new_dir.display()
+                )
+            } else {
+                format!(
+                    "Model folder switched to {}; re-select models and restart services",
+                    new_dir.display()
+                )
+            },
+            false,
+        );
     }
 }
 
@@ -763,7 +800,6 @@ impl eframe::App for RagGuiApp {
             });
 
         // Modals
-        self.render_delete_modal(&ctx);
         self.render_api_modal(&ctx);
         self.render_import_conflict_modal(&ctx);
         self.render_assign_confirm_modal(&ctx);
@@ -1231,8 +1267,6 @@ impl RagGuiApp {
         let p = palette(self.config.dark_mode);
         let mut do_import = false;
         let mut do_open_dir = false;
-        let mut do_restore_removed = false;
-        let mut to_delete = None;
         let mut to_export = None;
         let mut do_cancel_copy = false;
         let mut kind_selection: Option<ModelKind> = None;
@@ -1273,33 +1307,6 @@ impl RagGuiApp {
                         do_open_dir = true;
                     }
 
-                    if !self.config.ignored_models.is_empty() {
-                        let restore_label = if lang.is_zh() {
-                            format!("恢复已移除 ({})", self.config.ignored_models.len())
-                        } else {
-                            format!("Restore removed ({})", self.config.ignored_models.len())
-                        };
-                        if ui.button(restore_label).clicked() {
-                            do_restore_removed = true;
-                        }
-                        // 展开逐个恢复的列表。
-                        let toggle_label = if self.show_removed { "▾" } else { "▸" };
-                        if ui
-                            .button(
-                                RichText::new(toggle_label)
-                                    .size(11.0)
-                                    .color(p.text_secondary),
-                            )
-                            .on_hover_text(lang.t(
-                                "展开已移除模型列表，可逐个恢复",
-                                "Expand the removed list to restore one by one",
-                            ))
-                            .clicked()
-                        {
-                            self.show_removed = !self.show_removed;
-                        }
-                    }
-
                     ui.add_sized(
                         [150.0, CONTROL_HEIGHT],
                         egui::TextEdit::singleline(&mut self.search_query)
@@ -1309,48 +1316,6 @@ impl RagGuiApp {
             });
 
             ui.add_space(4.0);
-
-            // 已移除模型：折叠区逐行恢复（P2-2）。
-            if !self.config.ignored_models.is_empty() && self.show_removed {
-                ui.label(
-                    RichText::new(
-                        lang.t("已移除（文件保留在磁盘）:", "Removed (files kept on disk):"),
-                    )
-                    .size(11.0)
-                    .color(p.text_muted),
-                );
-                let mut restore_single: Option<String> = None;
-                for name in self.config.ignored_models.clone() {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&name).size(11.5).color(p.text_secondary));
-                        let restore_btn = egui::Button::new(
-                            RichText::new(lang.t("恢复", "Restore"))
-                                .size(10.5)
-                                .color(p.accent),
-                        )
-                        .frame(false);
-                        if ui.add(restore_btn).clicked() {
-                            restore_single = Some(name.clone());
-                        }
-                    });
-                }
-                if let Some(name) = restore_single {
-                    self.config
-                        .ignored_models
-                        .retain(|n| !n.eq_ignore_ascii_case(&name));
-                    self.save_config();
-                    self.refresh_models();
-                    self.set_status(
-                        if lang.is_zh() {
-                            format!("已恢复: {name}")
-                        } else {
-                            format!("Restored: {name}")
-                        },
-                        false,
-                    );
-                }
-                ui.add_space(4.0);
-            }
 
             // 后台复制进度（导入 / 导出共用，复制在独立线程中进行，界面保持可交互）。
             if let Some(job) = &self.import_job {
@@ -1405,7 +1370,6 @@ impl RagGuiApp {
                 .collect();
 
             let render_table = |ui: &mut egui::Ui,
-                                to_delete: &mut Option<String>,
                                 to_export: &mut Option<String>,
                                 kind_selection: &mut Option<ModelKind>,
                                 kind_changed: &mut Option<String>| {
@@ -1462,14 +1426,6 @@ impl RagGuiApp {
                                     .size(12.0)
                                     .color(p.text_strong),
                             );
-                            if is_in_use {
-                                ui.label(
-                                    RichText::new(lang.t("(运行中)", "(in use)"))
-                                        .size(10.5)
-                                        .strong()
-                                        .color(p.success),
-                                );
-                            }
                         });
 
                         table_cell(ui, COL_TYPE, |ui| {
@@ -1543,16 +1499,6 @@ impl RagGuiApp {
                                         .size(11.0)
                                         .color(p.text_muted),
                                 );
-                            } else {
-                                let remove_btn = egui::Button::new(
-                                    RichText::new(lang.t("移除", "Remove"))
-                                        .size(11.5)
-                                        .color(p.warning),
-                                )
-                                .frame(false);
-                                if ui.add(remove_btn).clicked() {
-                                    *to_delete = Some(model.file_name.clone());
-                                }
                             }
                         });
                     });
@@ -1586,25 +1532,13 @@ impl RagGuiApp {
                 });
                 ui.add_space(12.0);
             } else if filtered_models.len() <= 6 {
-                render_table(
-                    ui,
-                    &mut to_delete,
-                    &mut to_export,
-                    &mut kind_selection,
-                    &mut kind_changed,
-                );
+                render_table(ui, &mut to_export, &mut kind_selection, &mut kind_changed);
             } else {
                 egui::ScrollArea::vertical()
                     .max_height(160.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        render_table(
-                            ui,
-                            &mut to_delete,
-                            &mut to_export,
-                            &mut kind_selection,
-                            &mut kind_changed,
-                        );
+                        render_table(ui, &mut to_export, &mut kind_selection, &mut kind_changed);
                     });
             }
         });
@@ -1613,16 +1547,6 @@ impl RagGuiApp {
             let _ = std::process::Command::new("explorer")
                 .arg(&self.base_dir)
                 .spawn();
-        }
-        if do_restore_removed {
-            self.config.ignored_models.clear();
-            if self.save_config() {
-                self.refresh_models();
-                self.set_status(
-                    lang.t("已恢复所有移除的模型", "All removed models restored"),
-                    false,
-                );
-            }
         }
         if do_import {
             match self.model_mgr.import_model_dialog(lang) {
@@ -1682,9 +1606,6 @@ impl RagGuiApp {
                     );
                 }
             }
-        }
-        if let Some(file_name) = to_delete {
-            self.delete_confirm_file = Some(file_name);
         }
         if let (Some(file_name), Some(kind)) = (&kind_changed, kind_selection) {
             // 手动修正类型：写入 model_kinds 覆盖，持久化并刷新下拉过滤。
@@ -1890,246 +1811,284 @@ impl RagGuiApp {
         let mut auto_assign_changed = false;
         let mut redetect_llama = false;
         let mut pick_llama = false;
+        let mut open_llama_site = false;
         let mut open_hf = false;
+        let mut pick_model_dir = false;
+        let mut reset_model_dir = false;
+        let mut redetect_gpu = false;
 
         egui::ScrollArea::vertical()
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                // 1. 服务端口
+                // 1. 端口：两个端口并排一行，紧凑排布
                 card_frame(dark).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-            // 同时限制最大宽度：否则内容超出可用宽度时卡片会一起变宽，把右侧
-            // 控件挤出可见区域（高 DPI 下逻辑宽度偏小时尤其明显）。
-            ui.set_max_width(ui.available_width());
-                    section_title(ui, p, lang.t("模型端口", "Model ports"));
-                    ui.add_space(4.0);
-
-                    egui::Grid::new("settings_ports_grid")
-                        .num_columns(2)
-                        .spacing([12.0, 6.0])
-                        .show(ui, |ui| {
-                            for (idx, svc_type) in ServiceType::ALL.iter().enumerate() {
-                                ui.label(format!(
+                    ui.set_max_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        section_title(ui, p, lang.t("模型端口", "Model ports"));
+                        ui.add_space(8.0);
+                        for (idx, svc_type) in ServiceType::ALL.iter().enumerate() {
+                            ui.label(
+                                RichText::new(format!(
                                     "{} {}",
                                     svc_type.display_name(lang),
                                     lang.t("端口", "port")
-                                ));
-                                ui.add(
-                                    egui::DragValue::new(&mut self.edit_ports[idx])
-                                        .range(1024..=65535)
-                                        .speed(1.0),
-                                );
-                                ui.end_row();
+                                ))
+                                .size(11.5)
+                                .color(p.text_secondary),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.edit_ports[idx])
+                                    .range(1024..=65535)
+                                    .speed(1.0)
+                                    .min_decimals(0),
+                            );
+                            if idx + 1 < ServiceType::ALL.len() {
+                                ui.add_space(10.0);
+                            }
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .button(lang.t("保存端口", "Save ports"))
+                                .clicked()
+                            {
+                                save_ports = true;
                             }
                         });
-
-                    ui.add_space(4.0);
+                    });
                     ui.label(
                         RichText::new(lang.t(
                             "修改端口后，需要重启对应模型才能生效。",
                             "Restart the corresponding model after changing its port.",
                         ))
-                        .size(11.0)
+                        .size(10.5)
                         .color(p.text_muted),
                     );
-                    ui.add_space(4.0);
-
-                    if ui
-                        .button(lang.t("保存端口配置", "Save ports"))
-                        .clicked()
-                    {
-                        save_ports = true;
-                    }
                 });
 
                 ui.add_space(6.0);
 
-                // 2. llama.exe 路径
+                // 2. 模型目录：默认跟随 exe，可改为任意目录
                 card_frame(dark).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-            // 同时限制最大宽度：否则内容超出可用宽度时卡片会一起变宽，把右侧
-            // 控件挤出可见区域（高 DPI 下逻辑宽度偏小时尤其明显）。
-            ui.set_max_width(ui.available_width());
+                    ui.set_max_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        section_title(ui, p, lang.t("llama.exe 路径", "llama.exe path"));
-                        ui.add_space(4.0);
+                        section_title(ui, p, lang.t("模型目录", "Model folder"));
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(self.base_dir.to_string_lossy())
+                                .monospace()
+                                .size(10.5)
+                                .color(p.text_secondary),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(lang.t("选择目录", "Choose folder")).clicked() {
+                                pick_model_dir = true;
+                            }
+                            if self.config.model_dir.is_some()
+                                && ui.button(lang.t("恢复默认", "Use default")).clicked()
+                            {
+                                reset_model_dir = true;
+                            }
+                        });
+                    });
+                    ui.label(
+                        RichText::new(if self.config.model_dir.is_some() {
+                            lang.t(
+                                "已指定自定义目录；改回默认后使用 exe 所在目录。切换目录后需要重新选择模型并重启服务。",
+                                "Using a custom folder. Switching back uses the exe folder. Re-select models and restart services after switching.",
+                            )
+                        } else {
+                            lang.t(
+                                "默认使用 exe 所在目录；也可以指向任意本地目录存放 GGUF。",
+                                "Defaults to the folder containing the exe; you can point it at any local folder with GGUF files.",
+                            )
+                        })
+                        .size(10.5)
+                        .color(p.text_muted),
+                    );
+                });
 
-                        let found = self
-                            .service_mgr
-                            .get_llama_path()
-                            .map(|path| path.exists())
-                            .unwrap_or(false);
+                ui.add_space(6.0);
+
+                // 3. llama.exe：路径 + 重新检测 / 选择 / 去下载
+                card_frame(dark).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.set_max_width(ui.available_width());
+                    let found = self
+                        .service_mgr
+                        .get_llama_path()
+                        .map(|path| path.exists())
+                        .unwrap_or(false);
+                    ui.horizontal(|ui| {
+                        section_title(ui, p, lang.t("llama.exe", "llama.exe"));
+                        ui.add_space(8.0);
                         if found {
                             ui.colored_label(p.success, lang.t("已找到", "Found"));
                         } else {
                             ui.colored_label(p.danger, lang.t("未找到", "Not found"));
                         }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(lang.t("下载 Llama", "Download Llama")).clicked() {
+                                open_llama_site = true;
+                            }
+                            if ui
+                                .button(lang.t("手动选择路径", "Choose path"))
+                                .clicked()
+                            {
+                                pick_llama = true;
+                            }
+                            if ui.button(lang.t("重新检测", "Detect again")).clicked() {
+                                redetect_llama = true;
+                            }
+                        });
                     });
-                    ui.add_space(4.0);
-
                     match self.service_mgr.get_llama_path() {
                         Some(path) => {
                             ui.label(
                                 RichText::new(path.to_string_lossy())
                                     .monospace()
-                                    .size(11.0)
+                                    .size(10.5)
                                     .color(p.text_secondary),
                             );
                         }
                         None => {
                             ui.colored_label(
                                 p.danger,
-                                lang.t(
+                                RichText::new(lang.t(
                                     "未检测到 llama.exe，请安装 Llama 桌面端或手动指定路径。",
                                     "llama.exe was not found. Install the Llama desktop app or select its path.",
-                                ),
+                                ))
+                                .size(11.0),
                             );
                         }
                     }
-
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui.button(lang.t("重新检测", "Detect again")).clicked() {
-                            redetect_llama = true;
-                        }
-                        if ui
-                            .button(lang.t("手动选择路径", "Choose path"))
-                            .clicked()
-                        {
-                            pick_llama = true;
-                        }
-                    });
                 });
 
                 ui.add_space(6.0);
 
-                // 3. 环境信息
+                // 4. 显卡：型号 + 显存 + 采样方式
                 card_frame(dark).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-            // 同时限制最大宽度：否则内容超出可用宽度时卡片会一起变宽，把右侧
-            // 控件挤出可见区域（高 DPI 下逻辑宽度偏小时尤其明显）。
-            ui.set_max_width(ui.available_width());
-                    section_title(ui, p, lang.t("环境信息", "Environment"));
-                    ui.add_space(4.0);
-
+                    ui.set_max_width(ui.available_width());
                     let stats = self.monitor.get_stats();
-                    let llama_found = self
-                        .service_mgr
-                        .get_llama_path()
-                        .map(|path| path.exists())
-                        .unwrap_or(false);
-
-                    egui::Grid::new("settings_env_grid")
-                        .num_columns(2)
-                        .spacing([12.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label(RichText::new(lang.t("显卡", "GPU")).color(p.text_secondary));
-                            if stats.gpu_available && !stats.gpu_name.is_empty() {
-                                ui.label(RichText::new(&stats.gpu_name).color(p.text));
-                            } else {
-                                ui.label(
-                                    RichText::new(lang.t(
-                                        "未检测到独立显卡",
-                                        "No discrete GPU detected",
-                                    ))
-                                    .color(p.text_muted),
-                                );
-                            }
-                            ui.end_row();
-
+                    ui.horizontal(|ui| {
+                        section_title(ui, p, lang.t("显卡", "GPU"));
+                        ui.add_space(8.0);
+                        if !stats.gpu_name.is_empty() {
+                            ui.label(RichText::new(&stats.gpu_name).size(11.5).color(p.text));
+                        } else {
                             ui.label(
-                                RichText::new("llama.exe").color(p.text_secondary),
+                                RichText::new(lang.t("未检测到", "Not detected"))
+                                    .size(11.5)
+                                    .color(p.text_muted),
                             );
-                            if llama_found {
-                                ui.colored_label(p.success, lang.t("已找到", "Found"));
-                            } else {
-                                ui.colored_label(p.danger, lang.t("未找到", "Not found"));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(lang.t("重新检测", "Detect again")).clicked() {
+                                redetect_gpu = true;
                             }
-                            ui.end_row();
                         });
+                    });
+                    let detail = if !stats.gpu_available {
+                        lang.t(
+                            "未取到 GPU 数据（无独立显卡或驱动不支持性能计数器）",
+                            "No GPU data (no discrete GPU or the driver lacks performance counters)",
+                        )
+                    } else if stats.vram_total_known {
+                        lang.t("显存", "VRAM")
+                    } else {
+                        lang.t("显存（总量未知）", "VRAM (total unknown)")
+                    };
+                    let source = self.monitor.gpu_source(lang);
+                    let text = if stats.gpu_total_text().is_empty() {
+                        format!("{detail}  ·  {source}")
+                    } else {
+                        format!("{} {}  ·  {source}", detail, stats.gpu_total_text())
+                    };
+                    ui.label(RichText::new(text).size(10.5).color(p.text_muted));
                 });
 
                 ui.add_space(6.0);
 
-                // 4. 模型下载与安装说明
+                // 5. 模型下载与安装说明
                 card_frame(dark).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-            // 同时限制最大宽度：否则内容超出可用宽度时卡片会一起变宽，把右侧
-            // 控件挤出可见区域（高 DPI 下逻辑宽度偏小时尤其明显）。
-            ui.set_max_width(ui.available_width());
-                    section_title(ui, p, lang.t("模型下载与安装", "Model downloads"));
-                    ui.add_space(4.0);
+                    ui.set_max_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        section_title(ui, p, lang.t("模型下载", "Model downloads"));
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(self.base_dir.to_string_lossy())
+                                .monospace()
+                                .size(10.5)
+                                .color(p.text_muted),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .button(lang.t(
+                                    "打开 Hugging Face GGUF 模型页",
+                                    "Open Hugging Face GGUF models",
+                                ))
+                                .clicked()
+                            {
+                                open_hf = true;
+                            }
+                        });
+                    });
                     ui.label(
                         RichText::new(lang.t(
-                            "GGUF 模型可从 Hugging Face 下载。将向量或重排模型放入当前模型目录后，即可在「模型文件」中看到并分配。",
-                            "GGUF models can be downloaded from Hugging Face. Put embedding or reranker models in the current folder; they will appear under Model files.",
+                            "把向量或重排 GGUF 放进模型目录后，即可在「模型文件」中看到并分配。",
+                            "Put embedding or reranker GGUF files in the model folder; they appear under Model files.",
                         ))
-                        .size(11.5)
-                        .color(p.text_secondary),
+                        .size(10.5)
+                        .color(p.text_muted),
                     );
-                    ui.add_space(2.0);
-                    ui.label(
-                        RichText::new(self.base_dir.to_string_lossy())
-                            .monospace()
-                            .size(10.5)
-                            .color(p.text_muted),
-                    );
-                    ui.add_space(4.0);
-
-                    if ui
-                        .button(lang.t(
-                            "打开 Hugging Face GGUF 模型页",
-                            "Open Hugging Face GGUF models",
-                        ))
-                        .clicked()
-                    {
-                        open_hf = true;
-                    }
                 });
 
                 ui.add_space(6.0);
 
-                // 5. 行为偏好
+                // 6. 行为偏好
                 card_frame(dark).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-            // 同时限制最大宽度：否则内容超出可用宽度时卡片会一起变宽，把右侧
-            // 控件挤出可见区域（高 DPI 下逻辑宽度偏小时尤其明显）。
-            ui.set_max_width(ui.available_width());
+                    ui.set_max_width(ui.available_width());
                     section_title(ui, p, lang.t("行为偏好", "Behavior"));
-                    ui.add_space(4.0);
-                    ui.checkbox(
-                        &mut self.minimize_to_tray,
-                        lang.t(
-                            "点击关闭按钮时最小化到系统托盘",
-                            "Minimize to the system tray when closing",
-                        ),
-                    );
-                    ui.checkbox(
-                        &mut self.auto_stop_on_exit,
-                        lang.t(
-                            "退出管理器时自动停止本程序启动的 llama 模型进程",
-                            "Stop models started by this app when exiting",
-                        ),
-                    );
-                    let before = self.config.auto_assign_imported;
-                    ui.checkbox(
-                        &mut self.config.auto_assign_imported,
-                        lang.t(
-                            "导入模型后自动分配给对应服务",
-                            "Auto-assign imported models to their service",
-                        ),
-                    );
-                    if before != self.config.auto_assign_imported {
-                        auto_assign_changed = true;
-                    }
+                    ui.horizontal(|ui| {
+                        ui.checkbox(
+                            &mut self.minimize_to_tray,
+                            lang.t(
+                                "关闭时最小化到托盘",
+                                "Minimize to tray on close",
+                            ),
+                        );
+                        ui.add_space(12.0);
+                        ui.checkbox(
+                            &mut self.auto_stop_on_exit,
+                            lang.t(
+                                "退出时停止本程序启动的模型",
+                                "Stop models started by this app on exit",
+                            ),
+                        );
+                        ui.add_space(12.0);
+                        let before = self.config.auto_assign_imported;
+                        ui.checkbox(
+                            &mut self.config.auto_assign_imported,
+                            lang.t(
+                                "导入后自动分配给对应服务",
+                                "Auto-assign imported models",
+                            ),
+                        );
+                        if before != self.config.auto_assign_imported {
+                            auto_assign_changed = true;
+                        }
+                    });
                 });
             });
 
         if auto_assign_changed {
             self.save_config();
         }
-
         if save_ports && self.apply_port_drafts(true) {
             if self.service_mgr.has_pending_port_changes() {
                 self.set_status(
@@ -2142,6 +2101,18 @@ impl RagGuiApp {
             } else {
                 self.set_status(lang.t("端口配置已保存", "Ports saved"), false);
             }
+        }
+
+        if pick_model_dir
+            && let Some(dir) = rfd::FileDialog::new()
+                .set_title(lang.t("选择模型目录", "Select model folder"))
+                .pick_folder()
+        {
+            self.switch_model_dir(Some(dir));
+        }
+
+        if reset_model_dir {
+            self.switch_model_dir(None);
         }
 
         if redetect_llama {
@@ -2187,6 +2158,34 @@ impl RagGuiApp {
                     },
                     false,
                 );
+            }
+        }
+
+        if redetect_gpu {
+            self.monitor.reset_gpu();
+            self.set_status(lang.t("正在重新检测显卡…", "Re-detecting GPU…"), false);
+        }
+
+        if open_llama_site {
+            match std::process::Command::new("cmd")
+                .args(["/C", "start", "", LLAMA_SITE_URL])
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+            {
+                Ok(_) => self.set_status(
+                    lang.t(
+                        "已在浏览器中打开 Llama 下载页",
+                        "Opened the Llama download page in your browser",
+                    ),
+                    false,
+                ),
+                Err(e) => self.set_status(
+                    format!(
+                        "{}: {e}",
+                        lang.t("打开浏览器失败", "Failed to open browser")
+                    ),
+                    true,
+                ),
             }
         }
 
@@ -2237,8 +2236,8 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([780.0, 330.0])
-            .with_min_inner_size([760.0, 300.0])
+            .with_inner_size([780.0, 420.0])
+            .with_min_inner_size([760.0, 380.0])
             .with_icon(Arc::new(window_icon))
             .with_title("向量/重排模型管理器"),
         ..Default::default()
@@ -2249,4 +2248,33 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(RagGuiApp::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_dirs_prefers_existing_configured_dir() {
+        let dir = std::env::temp_dir().join(format!("llama-rag-gui-dirs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fallback = PathBuf::from(r"C:\nonexistent-fallback");
+        let configured = dir.to_string_lossy().to_string();
+        assert_eq!(resolve_dirs(fallback, Some(&configured)), dir);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_dirs_falls_back_when_configured_dir_missing() {
+        let fallback = PathBuf::from(r"D:\some\fallback");
+        let resolved = resolve_dirs(fallback.clone(), Some(r"C:\definitely-not-existing-dir"));
+        assert_eq!(resolved, fallback);
+    }
+
+    #[test]
+    fn resolve_dirs_without_model_dir_uses_fallback() {
+        let fallback = PathBuf::from(r"D:\some\fallback");
+        assert_eq!(resolve_dirs(fallback.clone(), None), fallback);
+    }
 }

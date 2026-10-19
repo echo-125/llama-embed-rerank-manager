@@ -52,24 +52,6 @@ impl RagGuiApp {
         ui.label(text);
         ui.add_space(8.0);
 
-        // 提示：如果这是之前「移除」过的模型，可以从恢复入口找回。
-        let was_ignored = self
-            .config
-            .ignored_models
-            .iter()
-            .any(|n| n.eq_ignore_ascii_case(&conflict.dest_name));
-        if was_ignored {
-            ui.label(
-                RichText::new(lang.t(
-                    "该模型此前被移除过，也可通过右上角「恢复已移除 (N)」重新显示。",
-                    "This model was removed before; use Restore removed (N) to show it again.",
-                ))
-                .size(11.0)
-                .color(p.text_muted),
-            );
-            ui.add_space(4.0);
-        }
-
         // 覆盖守卫：目标被运行中的服务占用时禁止覆盖。
         let dest_in_use = self
             .get_active_model_files()
